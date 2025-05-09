@@ -236,18 +236,48 @@ class LogProcessorCog(commands.Cog):
             if server_id and server_id not in self.sftp_managers:
                 logger.info(f"Creating new SFTPManager for server {server_id}")
                 # Create SFTPManager with the correct parameter mapping
-                # Get original_server_id if it exists
+                # Get original_server_id if it exists - this is the numeric ID for path construction
                 original_server_id = config.get("original_server_id")
+                
+                # Extract numeric ID from server name or other identifiers
+                numeric_id = None
+                # Try hostname first (often contains the numeric ID)
+                if hostname and '_' in hostname:
+                    hostname_parts = hostname.split('_')
+                    potential_id = hostname_parts[-1]
+                    if potential_id.isdigit():
+                        numeric_id = potential_id
+                        logger.info(f"Extracted numeric ID '{numeric_id}' from hostname: {hostname}")
+                
+                # If we didn't find a numeric ID in hostname, check server_name field
+                if not numeric_id and "server_name" in config:
+                    server_name = config["server_name"]
+                    # Look for numeric sequences in server name
+                    for word in str(server_name).split():
+                        if word.isdigit() and len(word) >= 4:
+                            numeric_id = word
+                            logger.info(f"Extracted numeric ID '{numeric_id}' from server name: {server_name}")
+                            break
+                
+                # Use extracted numeric ID if we found one and original_server_id isn't already set
+                if numeric_id and not original_server_id:
+                    original_server_id = numeric_id
+                    logger.info(f"Using extracted numeric ID for path construction: {numeric_id}")
+                
                 if original_server_id:
                     logger.info(f"Using original server ID for path construction: {original_server_id}")
+                else:
+                    logger.warning(f"No numeric/original server ID found, using UUID as fallback: {server_id}")
+                    original_server_id = server_id  # Fallback to UUID
 
+                # Create the SFTP manager with the properly resolved server IDs
                 self.sftp_managers[server_id] = SFTPManager(
-                    hostname=hostname,  # Map from sftp_host above
-                    port=port,          # Map from sftp_port
-                    username=username,  # Map from sftp_username
-                    password=password,  # Map from sftp_password
-                    server_id=server_id,  # Pass server_id for tracking
-                    original_server_id=original_server_id  # Pass original server ID for path construction
+                    hostname=hostname,      # Map from sftp_host
+                    port=port,              # Map from sftp_port
+                    username=username,      # Map from sftp_username
+                    password=password,      # Map from sftp_password
+                    server_id=server_id,    # Pass standardized server_id (UUID) for tracking
+                    original_server_id=original_server_id  # Pass original/numeric server ID for path construction
                 )
 
             # Get the SFTP client for this server
@@ -308,8 +338,16 @@ class LogProcessorCog(commands.Cog):
                         numeric_id = potential_id
                         logger.info(f"Extracted numeric ID from hostname: {numeric_id}")
 
-                # Use numeric ID for path if available
-                path_server_id = numeric_id or path_server_id
+                # Use original_server_id from config or numeric ID for path construction 
+                if numeric_id and not path_server_id:
+                    path_server_id = numeric_id
+                    logger.info(f"Using extracted numeric ID for path: {numeric_id}")
+
+                # Ensure we have the correct numeric path for mapping to the SFTP path
+                original_server_id = config.get("original_server_id")
+                if original_server_id and not path_server_id:
+                    path_server_id = original_server_id
+                    logger.info(f"Using original_server_id from config: {original_server_id}")
                 
                 # Build the path based on configured path or default structure
                 if sftp_path and sftp_path.startswith("/"):
@@ -317,8 +355,11 @@ class LogProcessorCog(commands.Cog):
                     logs_path = sftp_path
                     logger.info(f"Using absolute path from configuration: {logs_path}")
                 else:
-                    # Fallback to traditional path structure if no custom path
-                    logs_path = os.path.join("/", f"{hostname.split(':')[0]}_{path_server_id}", "Logs")
+                    # Use the NUMERIC server ID (7020) instead of UUID for folder path construction
+                    # For Tower of Temptation server structure, log files are at:
+                    # /hostname_serverid/Logs/Deadside.log where serverid is the numeric ID
+                    server_dir = f"{hostname.split(':')[0]}_{path_server_id}"
+                    logs_path = os.path.join("/", server_dir, "Logs")
                     logger.info(f"Using default directory structure with ID {path_server_id}: {logs_path}")
 
                 logger.info(f"Looking for log files in path: {logs_path}")

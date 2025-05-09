@@ -413,11 +413,20 @@ class SFTPManager:
         self.timeout = timeout
         self.max_retries = max_retries
         self.server_id = server_id
-        # Store the original server ID for path construction
+        
+        # Store numeric server ID for path construction - critical for correct folder paths
+        # If original_server_id is provided, it will be used for path construction
         self.original_server_id = original_server_id or server_id
-        # Log which server IDs we're using
+        
+        # Ensure original_server_id is a string 
+        if self.original_server_id is not None:
+            self.original_server_id = str(self.original_server_id)
+        
+        # Always log the server ID being used for path construction
         if original_server_id and original_server_id != server_id:
             logger.info(f"Using original server ID '{original_server_id}' for path construction instead of standardized ID '{server_id}'")
+        else:
+            logger.info(f"Using server ID '{server_id}' for path construction")
         self.client = None
         self.last_error = None
 
@@ -1242,10 +1251,20 @@ class SFTPClient:
         self._connected = False
         self._connection_attempts = 0
         self.server_id = str(server_id) if server_id else None
-        # Store the original server ID for path construction
+        
+        # Store the original server ID for path construction - critical for correct folder paths
+        # If original_server_id is provided, it will be used for path construction
         self.original_server_id = original_server_id or self.server_id
-        if original_server_id and original_server_id != server_id:
+        
+        # Ensure original_server_id is a string 
+        if self.original_server_id is not None:
+            self.original_server_id = str(self.original_server_id)
+        
+        # Always log the server ID being used for path construction
+        if original_server_id and str(original_server_id) != str(server_id):
             logger.info(f"SFTPClient using original server ID '{original_server_id}' for path construction instead of '{server_id}'")
+        else:
+            logger.info(f"SFTPClient using server ID '{server_id}' for path construction")
         self.last_error = None
         self.last_operation = None
         self.connection_id = f"{self.hostname}:{self.port}:{self.username}:{self.server_id}"
@@ -1813,14 +1832,25 @@ class SFTPClient:
         await self.ensure_connected()
 
         try:
-            # Use original_server_id for path construction if available, otherwise fall back to server_id
+            # CRITICAL: Always use original_server_id (numeric ID) for path construction 
+            # This ensures consistent path construction with the CSV file functions
             path_server_id = self.original_server_id if hasattr(self, 'original_server_id') and self.original_server_id else self.server_id
-            # Log which server ID we're using for path construction only in debug mode
-            logger.debug(f"Using server ID '{path_server_id}' for path construction in get_log_file")
+            
+            # Ensure we're using a string
+            if path_server_id is not None:
+                path_server_id = str(path_server_id)
+            
+            # Log which server ID we're using for path construction
+            logger.info(f"Using server ID '{path_server_id}' for path construction in get_log_file")
 
             # Construct path to logs directory - format: hostname_serverid/Logs/Deadside.log
-            server_dir = f"{self.hostname.split(':')[0]}_{path_server_id}"
+            hostname = self.hostname.split(':')[0] if self.hostname else "server" 
+            server_dir = f"{hostname}_{path_server_id}"
+            
+            # For Deadside logs in Tower of Temptation's server structure
+            # The path is always /hostname_serverid/Logs/Deadside.log where serverid is the numeric ID
             log_path = os.path.join("/", server_dir, "Logs")
+            logger.info(f"Constructed log path: {log_path} using server ID: {path_server_id}")
             deadside_log = os.path.join(log_path, "Deadside.log")
 
             # Log the exact path we're checking
@@ -2110,13 +2140,36 @@ class SFTPClient:
 
         logger.debug(f"Starting CSV file search in directory: {directory} (recursive={recursive}, max_depth={max_depth}, no_parent_search={no_parent_search})")
 
-        # Enforce the standard path structure and prevent parent directory traversal
+        # CRITICAL: Always use original_server_id (numeric ID) for path construction
+        # This ensures consistent path construction across functions
         hostname = self.hostname.split(':')[0] if self.hostname else "server"
-        server_path = f"{hostname}_{self.original_server_id}"
+        
+        # Check for original_server_id and use it for path construction
+        path_server_id = self.original_server_id if hasattr(self, 'original_server_id') and self.original_server_id else self.server_id
+        
+        # Ensure we're using a string
+        if path_server_id is not None:
+            path_server_id = str(path_server_id)
+        
+        # Log which server ID we're using for path construction
+        logger.info(f"Using server ID '{path_server_id}' for CSV path construction")
+        
+        server_path = f"{hostname}_{path_server_id}"
 
-        # Enforce the canonical path for CSV files
+        # Enforce the canonical path for CSV files - always use /hostname_serverid/actual1/deathlogs
+        # For Tower of Temptation server structure, CSV files are in subdirectories under:
+        # /hostname_serverid/actual1/deathlogs/**/*.csv
         canonical_path = os.path.join("/", server_path, "actual1", "deathlogs")
         directory = os.path.normpath(canonical_path)
+        
+        # Always set recursive=True for CSV files since we need to search subdirectories
+        recursive = True
+        
+        # Increase max_depth to ensure we can find files in nested map directories
+        max_depth = max(max_depth, 10)
+        
+        # Log the standardized path we're using
+        logger.info(f"Using standardized CSV path: {directory}")
 
         # Validate that we're in the correct directory structure
         if not directory.startswith(os.path.join("/", server_path)):

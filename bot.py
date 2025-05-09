@@ -295,9 +295,24 @@ async def initialize_bot(force_sync=False):
     try:
         # First get the list of cog files without awaiting anything
         cog_files = []
+        # Exclude files containing 'backup' and files with these suffixes or in filename
+        excluded_terms = ['backup', '_backup', '.bak', '.new', '.original', '.temp', '_temp', 'temp_', '_old', 'old_']
+        
         for f in os.listdir(cog_dir):
+            # Only include .py files that are not backup/temp files and don't start with _
             if f.endswith('.py') and not f.startswith('_'):
-                cog_files.append(f)
+                file_base = f[:-3]  # Remove .py extension
+                
+                # Check if file contains any excluded terms
+                if any(term in file_base.lower() for term in excluded_terms):
+                    logger.info(f"Skipping backup/temp cog file: {f}")
+                else:
+                    cog_files.append(f)
+                    
+                    # Log which file is being included for debugging
+                    logger.debug(f"Including cog file: {f}")
+        
+        logger.info(f"Found {len(cog_files)} cog files to load")
         
         # Now load each cog (load_extension is awaitable in discord.py 2.5.2)
         for filename in cog_files:
