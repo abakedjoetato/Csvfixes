@@ -437,17 +437,10 @@ class CSVProcessorCog(commands.Cog):
                     # Attempt connection with timeout
                     logger.info(f"SFTP connection attempt {connection_attempts}/{max_connection_attempts} for server {server_id}")
                     connect_timeout = 10  # seconds
-                    client = await asyncio.wait_for(
+                    sftp = await asyncio.wait_for(
                         sftp_manager.connect(),
                         timeout=connect_timeout
                     )
-                    
-                    # Set the client to the manager's client
-                    sftp = sftp_manager
-                    
-                    # Check connection status using the is_connected property
-                    if not sftp_manager.is_connected:
-                        raise ConnectionError(f"SFTP connection failed for server {server_id}")
                     
                     # Test connection by listing root directory
                     await sftp.listdir('/')
@@ -477,18 +470,13 @@ class CSVProcessorCog(commands.Cog):
                 logger.warning(f"Skipping SFTP operations for server {server_id} due to recent authentication failure")
                 return 0, 0
 
-            # Check connection state using the new is_connected property
-            was_connected = sftp.client is not None and sftp.client.is_connected
+            # Track connection state
+            was_connected = sftp.client is not None
             logger.debug(f"SFTP connection state before connect: connected={was_connected}")
 
             # Connect or ensure connection is active
             if not was_connected:
-                # Connect returns the client now, not a boolean
-                client = await sftp.connect()
-                # Verify the client is connected
-                if not client.is_connected:
-                    logger.error(f"Failed to connect to SFTP server for {server_id}")
-                    return 0, 0
+                await sftp.connect()
 
             try:
                 # Get the configured SFTP path from server settings

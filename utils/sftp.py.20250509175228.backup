@@ -554,12 +554,12 @@ class SFTPManager:
         # Fallback for older clients
         return self.client._connected if hasattr(self.client, '_connected') else False
 
-    async def connect(self) -> 'SFTPManager':
+    async def connect(self) -> 'SFTPClient':
         """Establish connection to SFTP server
 
         Returns:
-            SFTPManager: The manager instance for method chaining.
-            Check is_connected property to determine if connection was successful.
+            SFTPClient: The connected SFTP client for method chaining.
+            Check client.is_connected property to determine if connection was successful.
         """
         try:
             self.client = await get_sftp_client(
@@ -572,15 +572,23 @@ class SFTPManager:
                 server_id=self.server_id,
                 original_server_id=self.original_server_id  # Pass original server ID to client
             )
-            # Return self (manager) for method chaining, not the client
-            return self
+            return self.client
         except Exception as e:
             self.last_error = str(e)
             logger.error(f"Failed to connect to SFTP server {self.hostname}:{self.port}: {e}")
-            # Set client to None to indicate connection failure
-            self.client = None
-            # Still return self (manager) for consistent method chaining
-            return self
+            # Create and return a disconnected client for method chaining
+            disconnected_client = SFTPClient(
+                hostname=self.hostname,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+                server_id=self.server_id,
+                original_server_id=self.original_server_id
+            )
+            disconnected_client._connected = False
+            return disconnected_client
 
     # Delegation methods to forward calls to the client
     async def exists(self, path: str) -> bool:
@@ -735,18 +743,6 @@ class SFTPManager:
         except Exception as e:
             logger.error(f"Failed to list files in {directory}: {e}")
             return []
-            
-    async def listdir(self, directory: str) -> List[str]:
-        """List all files and directories in a directory (compatibility method)
-        
-        Args:
-            directory: Directory to list
-            
-        Returns:
-            List[str]: List of filenames and directory names
-        """
-        # This is a compatibility method that delegates to list_files
-        return await self.list_files(directory)
 
     async def read_file(self, remote_path: str, start_line: int = 0, max_lines: int = -1) -> Optional[List[str]]:
         """Read a file from the SFTP server
@@ -2309,8 +2305,7 @@ class SFTPClient:
 
         if not self._connected or not self._sftp_client:
             logger.warning(f"Not connected to SFTP server when checking if path exists: {path}")
-            self._connected = False
-        return self
+            return False
 
         try:
             # Use stat to check if path exists

@@ -536,30 +536,12 @@ class SFTPManager:
             logger.info(f"Using server ID '{server_id}' for path construction")
         self.client = None
         self.last_error = None
-        
-    @property
-    def is_connected(self) -> bool:
-        """Check if the client is connected and ready for operations
 
-        Returns:
-            bool: True if connected and ready, False otherwise
-        """
-        if self.client is None:
-            return False
-        
-        # If the client has an is_connected property, use it
-        if hasattr(self.client, 'is_connected'):
-            return self.client.is_connected
-            
-        # Fallback for older clients
-        return self.client._connected if hasattr(self.client, '_connected') else False
-
-    async def connect(self) -> 'SFTPManager':
+    async def connect(self) -> bool:
         """Establish connection to SFTP server
 
         Returns:
-            SFTPManager: The manager instance for method chaining.
-            Check is_connected property to determine if connection was successful.
+            bool: True if successful, False otherwise
         """
         try:
             self.client = await get_sftp_client(
@@ -572,15 +554,11 @@ class SFTPManager:
                 server_id=self.server_id,
                 original_server_id=self.original_server_id  # Pass original server ID to client
             )
-            # Return self (manager) for method chaining, not the client
-            return self
+            return True
         except Exception as e:
             self.last_error = str(e)
             logger.error(f"Failed to connect to SFTP server {self.hostname}:{self.port}: {e}")
-            # Set client to None to indicate connection failure
-            self.client = None
-            # Still return self (manager) for consistent method chaining
-            return self
+            return False
 
     # Delegation methods to forward calls to the client
     async def exists(self, path: str) -> bool:
@@ -735,18 +713,6 @@ class SFTPManager:
         except Exception as e:
             logger.error(f"Failed to list files in {directory}: {e}")
             return []
-            
-    async def listdir(self, directory: str) -> List[str]:
-        """List all files and directories in a directory (compatibility method)
-        
-        Args:
-            directory: Directory to list
-            
-        Returns:
-            List[str]: List of filenames and directory names
-        """
-        # This is a compatibility method that delegates to list_files
-        return await self.list_files(directory)
 
     async def read_file(self, remote_path: str, start_line: int = 0, max_lines: int = -1) -> Optional[List[str]]:
         """Read a file from the SFTP server
@@ -1594,15 +1560,6 @@ class SFTPClient:
         self.operation_count = 0
         self.last_activity = datetime.now()
 
-    @property
-    def is_connected(self) -> bool:
-        """Check if the client is connected and ready for operations
-
-        Returns:
-            bool: True if connected and ready, False otherwise
-        """
-        return self._connected and self._sftp_client is not None
-
     async def check_connection(self) -> bool:
         """Check if the connection is still valid by attempting a simple operation.
 
@@ -1644,19 +1601,14 @@ class SFTPClient:
 
     @retryable(max_retries=3, delay=1.0, backoff=2.0, 
                exceptions=(asyncio.TimeoutError, ConnectionError, OSError))
-    async def connect(self) -> 'SFTPClient':
+    async def connect(self) -> bool:
         """Connect to SFTP server with retries and exponential backoff
 
         This method will attempt to establish a connection up to max_retries times
         with an exponential backoff delay between attempts.
 
         Returns:
-            self: The SFTPClient instance for method chaining
-            
-        Note:
-            Check self.is_connected property to determine connection success.
-            This method always returns self (the client object) for method chaining,
-            not a boolean indicating success.
+            True if connected successfully, False otherwise
         """
         # Track memory usage before connection attempt
         try:
@@ -1670,7 +1622,7 @@ class SFTPClient:
 
         # If we already have a working connection, use it
         if self._connected and self._sftp_client and await self.check_connection():
-            return self
+            return True
 
         # Track details for diagnostic purposes
         start_time = datetime.now()
@@ -1696,14 +1648,12 @@ class SFTPClient:
             # Check required credentials and validate hostname
             if not self.hostname or not self.username:
                 logger.error(f"Missing required SFTP credentials for {self.server_id}")
-                self._connected = False
-                return self
+                return False
 
             # Early exit for obviously invalid test/example hostnames
             if '.example.' in self.hostname or self.hostname == 'localhost':
                 logger.warning(f"Invalid hostname detected for {self.server_id}: {self.hostname}")
-                self._connected = False
-                return self
+                return False
 
             logger.info(f"Connecting to SFTP server: {self.hostname}:{self.port} (attempt {self._connection_attempts})")
 
@@ -1752,7 +1702,7 @@ class SFTPClient:
             except Exception:
                 pass
                 
-            return self
+            return True
 
         except (asyncio.TimeoutError, ConnectionRefusedError, asyncssh.DisconnectError) as e:
             self._connected = False
@@ -1762,13 +1712,13 @@ class SFTPClient:
             if "Auth failed" in str(e) or "Permission denied" in str(e):
                 logger.error(f"Authentication failed for {self.connection_id}, will not retry to avoid lockout")
                 self._connection_attempts = self.max_retries + 1  # Exceed max retries to prevent further attempts
-                return self
+                return False
 
             logger.error(f"Failed to connect to SFTP server {self.connection_id}: {self.last_error}")
 
             # If we've exceeded max attempts, don't raise (stops retries) 
             if self._connection_attempts >= self.max_retries:
-                return self
+                return False
 
             # Otherwise propagate for retry
             raise
@@ -1783,7 +1733,7 @@ class SFTPClient:
             
             # If we've exceeded max attempts, don't raise (stops retries)
             if self._connection_attempts >= self.max_retries:
-                return self
+                return False
                 
             # Otherwise propagate for retry
             raise
@@ -1857,10 +1807,10 @@ class SFTPClient:
                 return
 
             # Need to connect or reconnect
-            sftp = await self.connect()
+            connected = await self.connect()
 
             # Verify connection was successful
-            if not sftp._connected:
+            if not connected or not self._connected:
                 logger.warning(f"Failed to establish SFTP connection for {self.connection_id}")
                 # Don't raise, just return and let caller handle missing connection
                 return
@@ -2309,8 +2259,7 @@ class SFTPClient:
 
         if not self._connected or not self._sftp_client:
             logger.warning(f"Not connected to SFTP server when checking if path exists: {path}")
-            self._connected = False
-        return self
+            return False
 
         try:
             # Use stat to check if path exists
