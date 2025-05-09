@@ -1,6 +1,6 @@
-# Tower of Temptation PvP Statistics Bot
+# Emeralds Killfeed PvP Statistics Bot
 
-A robust Discord bot for tracking Tower of Temptation PvP gameplay data, offering multi-guild isolation, player statistics, and advanced rivalry tracking with comprehensive debugging tools.
+A robust Discord bot for tracking PvP gameplay data, offering multi-guild isolation, player statistics, and advanced rivalry tracking with comprehensive debugging tools. The bot is designed to be completely dynamic with no hardcoded server details.
 
 ## Features
 
@@ -45,7 +45,7 @@ If the bot fails to start:
 
 ## Bot Architecture
 
-The Tower of Temptation PvP Statistics Bot is designed with a modular architecture:
+The Emeralds Killfeed PvP Statistics Bot is designed with a modular architecture:
 
 ### Discord Bot Components
 
@@ -67,7 +67,7 @@ The bot requires the following environment variables:
 
 ## Multi-Guild Isolation
 
-The Tower of Temptation PvP Statistics Bot is designed with robust multi-guild isolation:
+The Emeralds Killfeed PvP Statistics Bot is designed with robust multi-guild isolation:
 
 - Each Discord server (guild) has its own isolated data
 - Player statistics are tracked separately for each guild
@@ -76,12 +76,24 @@ The Tower of Temptation PvP Statistics Bot is designed with robust multi-guild i
 
 This ensures that multiple Discord communities can use the bot without data leakage between them.
 
+## Dynamic Server Identity System
+
+The bot includes a sophisticated server identity management system:
+
+- **UUID Resilience**: Maintains consistent server IDs even when UUIDs change due to server resets
+- **Database-Driven Mappings**: All server identity mappings are loaded from the database, with no hardcoded values
+- **Automatic Synchronization**: Server mappings are automatically updated during database synchronization
+- **Path Consistency**: Ensures consistent directory paths for log and CSV processing regardless of UUID changes
+- **Guild-Isolated Identities**: Two different guilds can use the same server ID without conflicts
+
 ## Database Architecture
 
 The bot uses MongoDB for storage and retrieval of all data:
 
 ### MongoDB Collections
 - **guilds**: Discord server configurations
+- **game_servers**: Game server details including server IDs and SFTP information
+- **servers**: Server identity mapping between UUIDs and original server IDs
 - **players**: Player statistics and profiles
 - **events**: Kill events and other game events
 - **bounties**: Active and completed bounties
@@ -90,7 +102,7 @@ The bot uses MongoDB for storage and retrieval of all data:
 
 ## Bot Utilities
 
-The Tower of Temptation PvP Statistics Bot includes several utilities for maintenance and management:
+The Emeralds Killfeed PvP Statistics Bot includes several utilities for maintenance and management:
 
 ### Bot Management Scripts
 
@@ -116,6 +128,9 @@ python test_multi_guild_isolation.py
 
 # Diagnose server issues
 python diagnose_server.py
+
+# Test server identity system
+python test_server_identity.py
 ```
 
 ### Database Tools
@@ -139,4 +154,4 @@ All server IDs, user IDs, and other sensitive identifiers are properly typed and
 
 ---
 
-Tower of Temptation PvP Statistics Bot © 2025
+Emeralds Killfeed PvP Statistics Bot © 2025

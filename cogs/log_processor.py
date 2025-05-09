@@ -1,5 +1,5 @@
 """
-Log Processor cog for the Tower of Temptation PvP Statistics Discord Bot.
+Log Processor cog for the Emeralds Killfeed PvP Statistics Discord Bot.
 
 This cog provides commands and background tasks for processing game log files:
 1. Background task for reading and processing log files in real-time
@@ -324,7 +324,7 @@ class LogProcessorCog(commands.Cog):
                 # Use the identified ID if it's a known server or different from what we have
                 if is_known:
                     path_server_id = numeric_id
-                    logger.info(f"Using known numeric ID '{numeric_id}' for Tower of Temptation server")
+                    logger.info(f"Using known numeric ID '{numeric_id}' for Emeralds Killfeed server")
                 else:
                     # Method 1: Get original_server_id directly from config if available
                     original_id = config.get("original_server_id")
@@ -427,7 +427,7 @@ class LogProcessorCog(commands.Cog):
                     logger.info(f"Using absolute path from configuration: {logs_path}")
                 else:
                     # Use the NUMERIC server ID (7020) instead of UUID for folder path construction
-                    # For Tower of Temptation server structure, log files are at:
+                    # For Emeralds Killfeed server structure, log files are at:
                     # /hostname_serverid/Logs/Deadside.log where serverid is the numeric ID
                     server_dir = f"{hostname.split(':')[0]}_{path_server_id}"
                     logs_path = os.path.join("/", server_dir, "Logs")

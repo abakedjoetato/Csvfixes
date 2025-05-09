@@ -1,5 +1,5 @@
 """
-Server Identity utility for the Tower of Temptation PvP Statistics Discord Bot.
+Server Identity utility for the Emeralds Killfeed PvP Statistics Discord Bot.
 
 This module maintains server identity across UUID changes and ensures 
 proper guild isolation for server identifiers.
@@ -12,13 +12,48 @@ from typing import Dict, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
 
-# Dictionary of known servers with stable numeric IDs
-# This is a fallback for when database lookups fail
-KNOWN_SERVERS = {
-    # Tower of Temptation server IDs
-    "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3": "7020",  # Original UUID
-    "1056852d-05f9-4e5e-9e88-012c2870c042": "7020",  # New UUID after reset
-}
+# Dictionary to store server UUID to numeric ID mappings
+# This will be populated from the database at runtime
+KNOWN_SERVERS = {}
+
+async def load_server_mappings(db):
+    """
+    Load server mappings from the database to populate KNOWN_SERVERS dictionary.
+    
+    Args:
+        db: Database connection object
+        
+    Returns:
+        Number of mappings loaded
+    """
+    global KNOWN_SERVERS
+    
+    if db is None:
+        logger.warning("Cannot load server mappings: database connection is None")
+        return 0
+        
+    try:
+        # Clear existing mappings to prevent stale data
+        KNOWN_SERVERS.clear()
+        
+        # Load all servers with original_server_id set
+        cursor = db.game_servers.find({"original_server_id": {"$exists": True}})
+        count = 0
+        
+        async for server in cursor:
+            server_id = server.get("server_id")
+            original_id = server.get("original_server_id")
+            
+            if server_id and original_id:
+                KNOWN_SERVERS[server_id] = str(original_id)
+                count += 1
+                logger.debug(f"Loaded server mapping: {server_id} -> {original_id}")
+                
+        logger.info(f"Loaded {count} server mappings from database")
+        return count
+    except Exception as e:
+        logger.error(f"Error loading server mappings: {e}")
+        return 0
 
 def identify_server(server_id: str, hostname: Optional[str] = None, 
                    server_name: Optional[str] = None, 
@@ -49,19 +84,7 @@ def identify_server(server_id: str, hostname: Optional[str] = None,
         logger.info(f"Using known ID '{KNOWN_SERVERS[server_id]}' for server {server_id}")
         return KNOWN_SERVERS[server_id], True
         
-    # Check for Tower of Temptation by name or hostname
-    is_tot = False
-    if hostname and 'tower' in hostname.lower() and 'temptation' in hostname.lower():
-        is_tot = True
-    elif server_name and 'tower' in server_name.lower() and 'temptation' in server_name.lower():
-        is_tot = True
-    # Handle Tower of Temptation detection by hostname IP (specific case for known server)
-    elif hostname and '79.127.236.1' in hostname:
-        is_tot = True
-        
-    if is_tot:
-        logger.info(f"Using known ID '7020' for Tower of Temptation server {server_id}")
-        return "7020", True
+    # No hardcoded server detection - rely on database for server identity
         
     # Try to extract numeric part from server ID if it exists
     if server_id:

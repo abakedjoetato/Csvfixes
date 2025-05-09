@@ -1,5 +1,5 @@
 """
-Database connection manager for Tower of Temptation PvP Statistics Bot
+Database connection manager for Emeralds Killfeed PvP Statistics Bot
 
 This module provides a unified interface for MongoDB database connections
 and handles connection pooling, reconnection logic, and error handling.
@@ -74,9 +74,9 @@ class DatabaseManager:
                 if db_name_part and len(db_name_part.strip()) > 0:
                     db_name = db_name_part
                 else:
-                    db_name = "tower_of_temptation"
+                    db_name = "emeralds_killfeed"
             else:
-                db_name = "tower_of_temptation"
+                db_name = "emeralds_killfeed"
         
         self.db_name = db_name
         self._client = None
@@ -467,6 +467,15 @@ class DatabaseManager:
                     )
             
             logger.info(f"Synchronized server data across collections: {game_servers_count} game servers, {servers_count} servers, {guilds_count} guilds processed")
+            
+            # Reload server mappings after synchronization
+            try:
+                from utils.server_identity import load_server_mappings
+                mappings_loaded = await load_server_mappings(self._db)
+                logger.info(f"Reloaded {mappings_loaded} server ID mappings after synchronization")
+            except Exception as mapping_err:
+                logger.error(f"Error reloading server ID mappings: {mapping_err}")
+                
             return True
             
         except Exception as e:

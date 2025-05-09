@@ -1,5 +1,5 @@
 """
-Tower of Temptation PvP Statistics Discord Bot
+Emeralds Killfeed PvP Statistics Discord Bot
 Main bot initialization and configuration
 
 This implementation uses discord.py 2.5.2 as the Discord API library, 
@@ -205,7 +205,7 @@ async def initialize_bot(force_sync=False):
         logger.info(f"Discord API version: {discord.__version__}")
         
         # Set bot status
-        activity = discord.Activity(type=discord.ActivityType.watching, name="Tower of Temptation")
+        activity = discord.Activity(type=discord.ActivityType.watching, name="Emeralds Killfeed")
         await bot.change_presence(activity=activity)
         
         # Initialize guilds database records for all connected guilds
@@ -219,6 +219,14 @@ async def initialize_bot(force_sync=False):
             try:
                 await bot.db.synchronize_server_data()
                 logger.info("Server data synchronization complete")
+                
+                # Load server mappings into the server_identity module
+                try:
+                    from utils.server_identity import load_server_mappings
+                    mappings_loaded = await load_server_mappings(bot.db)
+                    logger.info(f"Loaded {mappings_loaded} server ID mappings from database")
+                except Exception as mapping_err:
+                    logger.error(f"Error loading server ID mappings: {mapping_err}", exc_info=True)
             except Exception as e:
                 logger.error(f"Error during server data synchronization: {e}", exc_info=True)
         
@@ -261,6 +269,14 @@ async def initialize_bot(force_sync=False):
                     try:
                         await bot.db.synchronize_server_data()
                         logger.info(f"Synchronized server data after adding guild {guild.name}")
+                        
+                        # Reload server mappings after adding a new guild
+                        try:
+                            from utils.server_identity import load_server_mappings
+                            mappings_loaded = await load_server_mappings(bot.db)
+                            logger.info(f"Reloaded {mappings_loaded} server ID mappings after adding guild {guild.name}")
+                        except Exception as mapping_err:
+                            logger.error(f"Error reloading server ID mappings: {mapping_err}", exc_info=True)
                     except Exception as e:
                         logger.error(f"Error synchronizing server data after adding guild {guild.name}: {e}")
             else:

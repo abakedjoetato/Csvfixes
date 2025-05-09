@@ -1,5 +1,5 @@
 """
-Tower of Temptation PvP Statistics Discord Bot
+Emeralds Killfeed PvP Statistics Discord Bot
 Main entry point for Replit run button - runs the Discord bot directly
 as required by rule #7 in rules.md (Stack Integrity Is Mandatory)
 """
@@ -27,13 +27,13 @@ with open(".running_in_workflow", "w") as f:
 if __name__ == "__main__":
     # Print a banner to make it clear the bot is starting
     print("=" * 60)
-    print("  Tower of Temptation PvP Statistics Discord Bot")
+    print("  Emeralds Killfeed PvP Statistics Discord Bot")
     print("=" * 60)
     print(f"  Starting bot at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("  Press Ctrl+C to stop the bot")
     print("=" * 60)
     
-    logger.info("Starting Tower of Temptation PvP Statistics Discord Bot")
+    logger.info("Starting Emeralds Killfeed PvP Statistics Discord Bot")
     try:
         # Import and run the bot
         from bot import main as bot_main

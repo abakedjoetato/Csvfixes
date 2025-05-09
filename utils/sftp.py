@@ -2475,7 +2475,7 @@ class SFTPClient:
     ) -> List[str]:
         """Implementation of CSV file search with date filtering, enhanced for Tower of Temptation files
 
-        This implementation has been specifically enhanced to handle the Tower of Temptation
+        This implementation has been specifically enhanced to handle the Emeralds Killfeed
         directory structure where CSV files are located in map subdirectories:
         /hostname_serverid/actual1/deathlogs/world_0/*.csv
         /hostname_serverid/actual1/deathlogs/world_1/*.csv
@@ -2503,7 +2503,7 @@ class SFTPClient:
         server_path = f"{hostname}_{path_server_id}"
 
         # Enforce the canonical path for CSV files - always use /hostname_serverid/actual1/deathlogs
-        # For Tower of Temptation server structure, CSV files are in subdirectories under:
+        # For Emeralds Killfeed server structure, CSV files are in subdirectories under:
         # /hostname_serverid/actual1/deathlogs/**/*.csv
         canonical_path = os.path.join("/", server_path, "actual1", "deathlogs")
         directory = os.path.normpath(canonical_path)
@@ -2572,9 +2572,9 @@ class SFTPClient:
             if map_directories:
                 logger.debug(f"Found {len(map_directories)} map directories")
 
-        # Define patterns for matching Tower of Temptation CSV files (both pre and post April formats)
+        # Define patterns for matching Emeralds Killfeed CSV files (both pre and post April formats)
         csv_patterns = [
-            # Primary pattern - matches YYYY.MM.DD-HH.MM.SS.csv (Tower of Temptation standard)
+            # Primary pattern - matches YYYY.MM.DD-HH.MM.SS.csv (Emeralds Killfeed standard)
             r'\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}\.csv$',
 
             # Alternative patterns - match various date formats
@@ -2634,7 +2634,7 @@ class SFTPClient:
         logger.debug(f"Searching with date-formatted pattern across directory")
         date_pattern_files = await self.find_files_by_pattern(
             directory, 
-            csv_patterns[0],  # Use the primary pattern for Tower of Temptation
+            csv_patterns[0],  # Use the primary pattern for Emeralds Killfeed
             recursive=recursive, 
             max_depth=max_depth
         )
@@ -2677,7 +2677,7 @@ class SFTPClient:
                 os.path.join("/", "logs", os.path.basename(directory)),
                 os.path.join("/", "deathlogs", os.path.basename(directory)),
                 os.path.join("/", "Logs", os.path.basename(directory)),
-                # Additional Tower of Temptation specific paths
+                # Additional Emeralds Killfeed specific paths
                 os.path.join("/", "data", "logs"),
                 os.path.join("/", "data", "csv"),
                 os.path.join("/", "data", "deathlogs"),
@@ -2685,7 +2685,7 @@ class SFTPClient:
                 os.path.join("/", "game", "deathlogs")
             ]
 
-            # CRITICAL FIX: Add specific map subdirectory patterns for Tower of Temptation
+            # CRITICAL FIX: Add specific map subdirectory patterns for Emeralds Killfeed
             # Each map is in its own subdirectory under the deathlogs path
             deathlogs_dirs = [
                 os.path.join(directory, "deathlogs"),
@@ -2863,7 +2863,7 @@ class SFTPClient:
     async def _find_csv_files_recursive(self, directory: str, max_depth: int = 10) -> List[str]:
         """Find CSV files recursively in a directory structure with enhanced map directory support
 
-        This method is specialized for Tower of Temptation's directory structure where
+        This method is specialized for Emeralds Killfeed's directory structure where
         each subdirectory under the deathlogs path represents a different map.
         We need to search ALL map directories and collect ALL CSV files.
 
@@ -2940,7 +2940,7 @@ class SFTPClient:
             if not all_csv_files:
                 logger.debug(f"No CSV files found in map directories, trying standard pattern search")
 
-                # Use a specific pattern for Tower of Temptation CSV files
+                # Use a specific pattern for Emeralds Killfeed CSV files
                 # Format: YYYY.MM.DD-HH.MM.SS.csv or similar variations
                 csv_files = await self.find_files_by_pattern(
                     directory, 
