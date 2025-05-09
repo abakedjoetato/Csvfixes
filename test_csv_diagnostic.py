@@ -152,6 +152,10 @@ async def test_sftp_connection():
         # Create SFTP manager
         from utils.sftp import SFTPManager
         
+        # Remove sftp_path from config as it's not a valid parameter
+        if 'sftp_path' in sftp_config:
+            del sftp_config['sftp_path']
+            
         sftp = SFTPManager(server_id=TARGET_SERVER_ID, **sftp_config)
         logger.info(f"Created SFTP manager for {sftp_config['hostname']}:{sftp_config['port']}")
         
@@ -183,23 +187,28 @@ async def test_sftp_connection():
             sample_file = csv_files[0]
             logger.info(f"Testing download of {sample_file}")
             
-            content = await sftp.get_file_content(sample_file)
-            if not content:
-                logger.error(f"Failed to download {sample_file}")
-            else:
-                # Record success
-                global downloaded_files
-                downloaded_files.append(sample_file)
+            try:
+                # Use sftp.get_file method instead
+                file_size, remote_data = await sftp.get_file(sample_file)
                 
-                logger.info(f"Successfully downloaded {sample_file} ({len(content)} bytes)")
-                
-                # Show a sample of the content
-                if isinstance(content, bytes):
-                    try:
-                        sample = content[:200].decode('utf-8')
-                        logger.info(f"Content sample: {sample}")
-                    except:
-                        logger.error("Failed to decode content as UTF-8")
+                if not remote_data:
+                    logger.error(f"Failed to download {sample_file}")
+                else:
+                    # Record success
+                    global downloaded_files
+                    downloaded_files.append(sample_file)
+                    
+                    logger.info(f"Successfully downloaded {sample_file} ({file_size} bytes)")
+                    
+                    # Show a sample of the content
+                    if isinstance(remote_data, bytes):
+                        try:
+                            sample = remote_data[:200].decode('utf-8')
+                            logger.info(f"Content sample: {sample}")
+                        except:
+                            logger.error("Failed to decode content as UTF-8")
+            except Exception as e:
+                logger.error(f"Error downloading file: {e}")
                 
         # Disconnect
         await sftp.disconnect()
@@ -215,7 +224,7 @@ async def test_historical_parsing():
     logger.info("=== Testing Historical Parsing ===")
     try:
         # Create bot instance
-        from bot import PvPBot, initialize_bot
+        from bot import initialize_bot
         
         # Initialize the bot
         bot = await initialize_bot(force_sync=False)
@@ -237,18 +246,11 @@ async def test_historical_parsing():
         # Try running historical parse with a 1-day window to minimize processing time
         logger.info(f"Running historical parse for {TARGET_SERVER_ID} with 1-day window")
         
-        # Get server configuration first to ensure we have all required parameters
-        server_configs = await csv_processor._get_server_configs()
-        if not server_configs or TARGET_SERVER_ID not in server_configs:
-            logger.error(f"No configuration found for server {TARGET_SERVER_ID}")
-            return False
-            
-        server_config = server_configs[TARGET_SERVER_ID]
-        logger.info(f"Using server configuration: {json.dumps(server_config, default=str)}")
+        # Skip server config retrieval - we'll use run_historical_parse directly
         
-        # Use direct config method to ensure we have all parameters
-        files_processed, events_processed = await csv_processor.run_historical_parse_with_config(
-            TARGET_SERVER_ID, server_config, days=1
+        # Use standard historical parse method
+        files_processed, events_processed = await csv_processor.run_historical_parse(
+            TARGET_SERVER_ID, days=1
         )
         
         global processed_files, processed_kills, processed_suicides
