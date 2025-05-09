@@ -295,7 +295,15 @@ class CSVProcessorCog(commands.Cog):
                 original_server_id = server.get("original_server_id", raw_server_id)
                 if not original_server_id:
                     original_server_id = raw_server_id
-
+                    
+                # Special case for Tower of Temptation
+                if server_id == "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3" or (
+                    server.get("server_name", "").lower().find("tower") >= 0 and 
+                    server.get("server_name", "").lower().find("temptation") >= 0
+                ):
+                    original_server_id = "7020"
+                    logger.info(f"Setting Tower of Temptation server ID to known numeric ID: 7020")
+                
                 # Log the original server ID being used
                 logger.debug(f"Using original_server_id={original_server_id} for server {server_id}")
 
@@ -410,6 +418,11 @@ class CSVProcessorCog(commands.Cog):
                 # Always try to get original_server_id first
                 path_server_id = config.get("original_server_id")
 
+                # Special case for Tower of Temptation
+                if server_id == "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3":
+                    path_server_id = "7020"
+                    logger.info(f"Using known Tower of Temptation server ID: 7020")
+                
                 # If no original_server_id, try numeric extraction from hostname
                 if not path_server_id:
                     hostname = config.get("hostname", "")
@@ -419,14 +432,19 @@ class CSVProcessorCog(commands.Cog):
                             path_server_id = potential_id
                             logger.info(f"Using numeric ID from hostname: {potential_id}")
 
-                # Second attempt: try server name
+                # Check for Tower of Temptation by server name
                 if not path_server_id:
                     server_name = config.get("server_name", "")
-                    for word in str(server_name).split():
-                        if word.isdigit() and len(word) >= 4:
-                            path_server_id = word
-                            logger.info(f"Using numeric ID from server name: {word}")
-                            break
+                    if server_name and "tower" in str(server_name).lower() and "temptation" in str(server_name).lower():
+                        path_server_id = "7020"
+                        logger.info(f"Detected Tower of Temptation server by name, using ID: 7020")
+                    # Otherwise try to extract numeric ID from server name
+                    elif server_name:
+                        for word in str(server_name).split():
+                            if word.isdigit() and len(word) >= 4:
+                                path_server_id = word
+                                logger.info(f"Using numeric ID from server name: {word}")
+                                break
 
                 # Last resort: use server_id but log warning
                 if not path_server_id:
@@ -867,8 +885,24 @@ class CSVProcessorCog(commands.Cog):
                                 content = await sftp.download_file(file_path)
 
                                 if content:
+                                    # Handle different types of content returned from download_file
+                                    if isinstance(content, bytes):
+                                        # Normal case - bytes returned
+                                        decoded_content = content.decode('utf-8', errors='ignore')
+                                    elif isinstance(content, list):
+                                        # Handle case where a list of strings/bytes is returned
+                                        if content and isinstance(content[0], bytes):
+                                            # List of bytes
+                                            decoded_content = b''.join(content).decode('utf-8', errors='ignore')
+                                        else:
+                                            # List of strings or empty list
+                                            decoded_content = '\n'.join([str(line) for line in content])
+                                    else:
+                                        # Handle any other case by converting to string
+                                        decoded_content = str(content)
+                                        
                                     # Process content
-                                    events = self.csv_parser.parse_csv_data(content.decode('utf-8'))
+                                    events = self.csv_parser.parse_csv_data(decoded_content)
 
                                     # Normalize and deduplicate events
                                     processed_count = 0

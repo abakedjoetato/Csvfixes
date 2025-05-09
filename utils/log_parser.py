@@ -89,7 +89,7 @@ class PlayerLifecycleTracker:
             'event_type': 'register',
             'status': 'queued'
         }
-        if player_id is not None not in self.player_history:
+        if player_id is not None and player_id not in self.player_history:
             self.player_history[player_id] = []
         self.player_history[player_id].append(event)
         return event
@@ -107,7 +107,7 @@ class PlayerLifecycleTracker:
             'event_type': 'unregister',
             'status': 'offline'
         }
-        if player_id is not None not in self.player_history:
+        if player_id is not None and player_id not in self.player_history:
             self.player_history[player_id] = []
         self.player_history[player_id].append(event)
         return event
@@ -126,7 +126,7 @@ class PlayerLifecycleTracker:
         
         # Add to history by name since we might not have ID
         player_key = f"name:{player_name}"
-        if player_key is not None not in self.player_history:
+        if player_key is not None and player_key not in self.player_history:
             self.player_history[player_key] = []
         self.player_history[player_key].append(event)
         return event
@@ -344,17 +344,32 @@ class GameEventTracker:
 class LogParser:
     """Main log parser class that coordinates all trackers."""
     
-    def __init__(self, hostname: str, server_id: str):
+    def __init__(self, hostname: str, server_id: str, original_server_id: Optional[str] = None):
         self.player_tracker = PlayerLifecycleTracker()
         self.mission_tracker = MissionTracker()
         self.event_tracker = GameEventTracker()
         self.processed_lines = 0
-        # Use standardized log path structure
+        
+        # Store both server IDs - the UUID for database reference and original numeric ID for paths
+        self.server_uuid = server_id  # The UUID format ID for database records
+        self.original_server_id = original_server_id or server_id  # The original/numeric ID for path construction
+        
+        # Special case for Tower of Temptation server
+        if server_id == "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3" or (
+            # Check hostname for Tower of Temptation references
+            hostname and 'tower' in hostname.lower() and 'temptation' in hostname.lower()
+        ):
+            logger.info("Using known numeric ID '7020' for Tower of Temptation server in LogParser")
+            self.original_server_id = "7020"
+            
+        # Use standardized log path structure with NUMERIC server ID, not UUID
         clean_hostname = hostname.split(':')[0] if hostname else "server"
-        self.base_path = os.path.join("/", f"{clean_hostname}_{server_id}", "Logs")
+        self.base_path = os.path.join("/", f"{clean_hostname}_{self.original_server_id}", "Logs")
+        logger.info(f"LogParser initialized with base_path: {self.base_path} (using original_server_id: {self.original_server_id})")
+        
         self.last_processed_timestamp = None
         self.max_player_count = None
-        self.server_id = None
+        self.server_id = None  # This will be extracted from the logs
         self.server_name = None
         self.player_names = {}  # Map player_id to player_name
         
@@ -745,8 +760,88 @@ class LogParser:
 
 
 # Function to create a parser and process a log file
-def parse_log_file(file_path: str, start_line: int = 0, max_lines: Optional[int] = None) -> Tuple[LogParser, List[Dict[str, Any]]]:
-    """Parse a log file and return the parser and important events."""
-    parser = LogParser()
-    events = parser.parse_file(file_path, start_line, max_lines)
-    return parser, events
+def parse_log_file(file_content: str, hostname: str = "localhost", server_id: str = "default", original_server_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Parse log file content and return important events.
+    
+    Args:
+        file_content: The content of the log file as a string
+        hostname: The hostname for the server (used for path construction)
+        server_id: The server ID (UUID format)
+        original_server_id: The original numeric server ID
+        
+    Returns:
+        List of parsed events from the log file
+    """
+    # Define the regex patterns for parsing log entries
+    TIMESTAMP_PATTERN = r'\[([^\]]+)\]\s+'
+    KILL_PATTERN = re.compile(
+        rf'{TIMESTAMP_PATTERN}LogSFPS: Player ([^\s]+) \(([^\)]+)\) killed player ([^\s]+) \(([^\)]+)\)(?: with (.+))?'
+    )
+    PLAYER_JOINED_PATTERN = re.compile(
+        rf'{TIMESTAMP_PATTERN}LogSFPS: Player ([^\s]+) \(([^\)]+)\) connected'
+    )
+    PLAYER_LEFT_PATTERN = re.compile(
+        rf'{TIMESTAMP_PATTERN}LogSFPS: Player ([^\s]+) \(([^\)]+)\) disconnected'
+    )
+    
+    # Helper function to parse log timestamps
+    def parse_log_timestamp(timestamp_str: str) -> datetime:
+        """Parse a timestamp string from the log into a datetime object."""
+        try:
+            # Handle different timestamp formats
+            if '.' in timestamp_str:  # Format with milliseconds
+                return datetime.strptime(timestamp_str, "%Y.%m.%d-%H.%M.%S.%f")
+            else:  # Format without milliseconds
+                return datetime.strptime(timestamp_str, "%Y.%m.%d-%H.%M.%S")
+        except ValueError:
+            # If parsing fails, return current time
+            return datetime.now()
+    # Split content into lines and filter out empty lines
+    lines = [line for line in file_content.splitlines() if line.strip()]
+    
+    # Process each line to extract events
+    events = []
+    for line in lines:
+        # Check for different event types
+        # Kill events
+        kill_match = KILL_PATTERN.search(line)
+        if kill_match:
+            timestamp, killer_id, killer_name, victim_id, victim_name, weapon = kill_match.groups()
+            events.append({
+                "timestamp": parse_log_timestamp(timestamp),
+                "event_type": "kill",
+                "killer_id": killer_id,
+                "killer_name": killer_name,
+                "victim_id": victim_id,
+                "victim_name": victim_name,
+                "weapon": weapon
+            })
+            continue
+            
+        # Connection events - player joined
+        join_match = PLAYER_JOINED_PATTERN.search(line)
+        if join_match:
+            timestamp, player_id, player_name = join_match.groups()
+            events.append({
+                "timestamp": parse_log_timestamp(timestamp),
+                "event_type": "connection",
+                "player_id": player_id,
+                "player_name": player_name,
+                "action": "joined"
+            })
+            continue
+            
+        # Connection events - player left
+        left_match = PLAYER_LEFT_PATTERN.search(line)
+        if left_match:
+            timestamp, player_id, player_name = left_match.groups()
+            events.append({
+                "timestamp": parse_log_timestamp(timestamp),
+                "event_type": "connection",
+                "player_id": player_id,
+                "player_name": player_name,
+                "action": "left"
+            })
+            continue
+            
+    return events

@@ -295,22 +295,57 @@ async def initialize_bot(force_sync=False):
     try:
         # First get the list of cog files without awaiting anything
         cog_files = []
-        # Exclude files containing 'backup' and files with these suffixes or in filename
-        excluded_terms = ['backup', '_backup', '.bak', '.new', '.original', '.temp', '_temp', 'temp_', '_old', 'old_']
         
+        # Comprehensive list of excluded terms for backup and temporary files
+        excluded_terms = [
+            # Standard backup patterns
+            'backup', '_backup', '.bak', '.backup', 
+            # Temporary files
+            '.temp', '_temp', 'temp_', '.tmp', '_tmp', 'tmp_',
+            # New/original versions
+            '.new', '.old', '_new', '_old', 'old_', 'new_', 
+            # Original files
+            '.original', '_original', 'original_',
+            # Copy files
+            '.copy', '_copy', 'copy_',
+            # Version indicators
+            '.v1', '.v2', '.v3', '_v1', '_v2', '_v3'
+        ]
+        
+        # First collect all valid Python files, filtering out duplicates
+        valid_files = {}
         for f in os.listdir(cog_dir):
-            # Only include .py files that are not backup/temp files and don't start with _
+            # Only include .py files that don't start with _
             if f.endswith('.py') and not f.startswith('_'):
                 file_base = f[:-3]  # Remove .py extension
+                normalized_name = file_base.lower()
                 
-                # Check if file contains any excluded terms
-                if any(term in file_base.lower() for term in excluded_terms):
+                # Skip if this file contains any excluded terms
+                if any(term in normalized_name for term in excluded_terms):
                     logger.info(f"Skipping backup/temp cog file: {f}")
+                    continue
+                
+                # Special case: If the file is a base version (e.g., "csv_processor.py"),
+                # it should always be included instead of variants
+                if "_" not in normalized_name and "." not in normalized_name:
+                    # This is a base module (e.g., "admin.py" not "admin_backup.py")
+                    valid_files[normalized_name] = f
+                    logger.debug(f"Including base cog file: {f}")
                 else:
-                    cog_files.append(f)
-                    
-                    # Log which file is being included for debugging
-                    logger.debug(f"Including cog file: {f}")
+                    # Handle variant module names (only if we don't already have the base version)
+                    # Extract base module name before "_" or "."
+                    base_module = normalized_name.split('_')[0].split('.')[0]
+                    if base_module not in valid_files:
+                        valid_files[normalized_name] = f
+                        logger.debug(f"Including variant cog file: {f}")
+                    else:
+                        logger.info(f"Skipping duplicate variant of {base_module}: {f}")
+        
+        # Convert to list for loading
+        cog_files = list(valid_files.values())
+        
+        # Sort alphabetically for consistent loading order
+        cog_files.sort()
         
         logger.info(f"Found {len(cog_files)} cog files to load")
         

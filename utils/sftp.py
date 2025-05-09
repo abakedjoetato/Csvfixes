@@ -17,6 +17,7 @@ import io
 import functools
 import random
 import stat
+import time
 import traceback
 from typing import List, Dict, Any, Optional, Tuple, Union, BinaryIO, Set, Callable, Sequence
 from datetime import datetime, timedelta
@@ -677,12 +678,16 @@ class SFTPManager:
             # Still set client to None even if there was an error
             self.client = None
 
-    async def get_log_file(self) -> Optional[str]:
+    async def get_log_file(self, server_dir: Optional[str] = None, base_path: Optional[str] = None) -> Optional[str]:
         """Get the Deadside.log file path using multiple search strategies
 
         This method tries multiple path formats to locate the log file:
         1. Standard path: /{hostname}_{server_id}/Logs/Deadside.log (MOST COMMON)
         2. Direct path: /Logs/Deadside.log
+        
+        Args:
+            server_dir: Optional pre-constructed server directory (e.g., "hostname_serverid")
+            base_path: Optional base path override for finding the log file
         3. Server name path: /{server_id}/Logs/Deadside.log
         4. Recursive search from root for Deadside.log (limited depth)
 
@@ -1126,6 +1131,137 @@ class SFTPManager:
             logger.error(f"Error getting file stats for {path}: {e}")
             return None
 
+    async def _download_to_memory(self, path: str) -> Optional[bytes]:
+        """Helper method to download file to memory with multiple implementation strategies
+        
+        Args:
+            path: Path to file on SFTP server
+            
+        Returns:
+            bytes: File contents or None if error
+        """
+        if not self.client:
+            logger.error("Not connected when trying to download to memory")
+            return None
+            
+        # Try multiple methods to download file to memory
+        try:
+            # Special case for AsyncSSH - detect by module
+            # This check avoids attribute errors when the client doesn't have expected methods
+            try:
+                import asyncssh
+                if isinstance(self.client, asyncssh.SFTPClient):
+                    logger.info(f"Detected AsyncSSH SFTP client, using optimized methods")
+                    try:
+                        # Try the direct AsyncSSH method for reading files
+                        content = await self.client.readfile(path)
+                        if isinstance(content, str):
+                            content = content.encode('utf-8')
+                        logger.info(f"Downloaded {path} using AsyncSSH readfile ({len(content)} bytes)")
+                        return content
+                    except Exception as ssh_err:
+                        logger.warning(f"AsyncSSH readfile failed: {ssh_err}, trying other methods")
+            except (ImportError, Exception) as e:
+                # If asyncssh isn't available or there's another error, continue with other methods
+                logger.debug(f"AsyncSSH special handling skipped: {e}")
+            
+            # Method 1: Use getfo if available (most efficient)
+            if hasattr(self.client, 'getfo'):
+                try:
+                    file_obj = io.BytesIO()
+                    await self.client.getfo(path, file_obj)
+                    file_obj.seek(0)
+                    content = file_obj.read()
+                    logger.info(f"Downloaded {path} to memory using getfo ({len(content)} bytes)")
+                    return content
+                except Exception as getfo_err:
+                    logger.warning(f"getfo method failed: {getfo_err}, trying alternatives")
+            
+            # Method 2: Use read if available
+            if hasattr(self.client, 'read'):
+                try:
+                    content = await self.client.read(path)
+                    logger.info(f"Downloaded {path} to memory using read ({len(content)} bytes)")
+                    return content
+                except Exception as read_err:
+                    logger.warning(f"read method failed: {read_err}, trying alternatives")
+                    
+            # Method 3: Use open+read if available
+            if hasattr(self.client, 'open'):
+                try:
+                    async with self.client.open(path, 'rb') as f:
+                        content = await f.read()
+                    logger.info(f"Downloaded {path} to memory using open+read ({len(content)} bytes)")
+                    return content
+                except Exception as open_err:
+                    logger.warning(f"open method failed: {open_err}, trying alternatives")
+                    
+            # Method 4: Try other AsyncSSH-style methods by string matching on type
+            try:
+                # Check if this looks like an asyncssh SFTP client
+                client_type = str(type(self.client)).lower()
+                if 'asyncssh' in client_type or 'sftp' in client_type:
+                    # Try some common methods that might be available
+                    for method_name in ['readfile', 'getfile', 'download', 'read_file', 'fetch']:
+                        if hasattr(self.client, method_name):
+                            try:
+                                logger.info(f"Trying alternative method: {method_name}")
+                                
+                                if method_name in ['readfile', 'read_file', 'fetch', 'download']:
+                                    # Methods that return content directly
+                                    content = await getattr(self.client, method_name)(path)
+                                    if content:
+                                        if isinstance(content, str):
+                                            content = content.encode('utf-8') 
+                                        logger.info(f"Downloaded using {method_name} ({len(content)} bytes)")
+                                        return content
+                                else:
+                                    # Methods that write to a file-like object
+                                    file_obj = io.BytesIO()
+                                    await getattr(self.client, method_name)(path, file_obj)
+                                    file_obj.seek(0)
+                                    content = file_obj.read()
+                                    if content:
+                                        logger.info(f"Downloaded using {method_name} ({len(content)} bytes)")
+                                        return content
+                            except Exception as method_err:
+                                logger.debug(f"Method {method_name} failed: {method_err}")
+            except Exception as type_err:
+                logger.debug(f"Type-based method detection failed: {type_err}")
+            
+            # Method 5: Use get with a temporary file (least efficient but reliable fallback)
+            temp_file = f"temp_{int(time.time())}.tmp"
+            try:
+                await self.client.get(path, temp_file)
+                
+                # Read the temp file
+                with open(temp_file, 'rb') as f:
+                    content = f.read()
+                
+                # Clean up temp file
+                try:
+                    os.remove(temp_file)
+                except Exception as rm_err:
+                    logger.warning(f"Failed to remove temp file {temp_file}: {rm_err}")
+                    
+                logger.info(f"Downloaded {path} to memory using temp file ({len(content)} bytes)")
+                return content
+            except Exception as temp_err:
+                logger.warning(f"Temp file method failed: {temp_err}")
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except:
+                    pass
+            
+            # If we reach here, all methods failed
+            logger.error(f"All download methods failed for {path}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error downloading file {path} to memory: {e}")
+            return None
+
     async def download_file(self, path: str) -> Optional[bytes]:
         """Download file contents with enhanced error handling and retries
 
@@ -1151,12 +1287,15 @@ class SFTPManager:
         max_attempts = 2
         for attempt in range(1, max_attempts + 1):
             try:
-                # Call the client's download_file method
-                data = await self.client.download_file(path)
-
+                # Use the helper method that will try multiple download strategies
+                data = await self._download_to_memory(path)
+                
                 # Handle None results safely
                 if not data:
                     logger.warning(f"download_file returned None for {path}")
+                    if attempt < max_attempts:
+                        logger.info(f"Retrying download (attempt {attempt+1}/{max_attempts})...")
+                        continue
                     return None
 
                 # Log success
@@ -1569,6 +1708,144 @@ class SFTPClient:
             logger.error(f"Failed to get file info for {path}: {e}")
             return None
 
+    async def _download_to_memory(self, remote_path: str) -> Optional[bytes]:
+        """Helper to download file to memory with multiple implementation strategies
+        
+        Args:
+            remote_path: Path to file on SFTP server
+            
+        Returns:
+            bytes: File contents or None if error
+        """
+        if not self._sftp_client:
+            logger.error("Not connected when trying to download to memory")
+            return None
+            
+        # Try multiple methods to download file to memory
+        try:
+            # Special case for AsyncSSH - detect by module
+            # This check avoids attribute errors when the client doesn't have expected methods
+            try:
+                import asyncssh
+                if isinstance(self._sftp_client, asyncssh.SFTPClient):
+                    logger.info(f"Detected AsyncSSH SFTP client, using optimized methods")
+                    try:
+                        # Try the direct AsyncSSH method for reading files
+                        content = await self._sftp_client.readfile(remote_path)
+                        self.last_activity = datetime.now()
+                        if isinstance(content, str):
+                            content = content.encode('utf-8')
+                        logger.info(f"Downloaded {remote_path} using AsyncSSH readfile ({len(content)} bytes)")
+                        return content
+                    except Exception as ssh_err:
+                        logger.warning(f"AsyncSSH readfile failed: {ssh_err}, trying other methods")
+            except (ImportError, Exception) as e:
+                # If asyncssh isn't available or there's another error, continue with other methods
+                logger.debug(f"AsyncSSH special handling skipped: {e}")
+                
+            # Method 1: Use getfo if available (most efficient)
+            if hasattr(self._sftp_client, 'getfo'):
+                try:
+                    file_obj = io.BytesIO()
+                    await self._sftp_client.getfo(remote_path, file_obj)
+                    self.last_activity = datetime.now()
+                    file_obj.seek(0)
+                    content = file_obj.read()
+                    logger.info(f"Downloaded {remote_path} to memory using getfo ({len(content)} bytes)")
+                    return content
+                except Exception as getfo_err:
+                    logger.warning(f"getfo method failed: {getfo_err}, trying alternatives")
+            
+            # Method 2: Use read if available
+            if hasattr(self._sftp_client, 'read'):
+                try:
+                    content = await self._sftp_client.read(remote_path)
+                    self.last_activity = datetime.now()
+                    logger.info(f"Downloaded {remote_path} to memory using read ({len(content)} bytes)")
+                    return content
+                except Exception as read_err:
+                    logger.warning(f"read method failed: {read_err}, trying alternatives")
+                    
+            # Method 3: Use open+read if available
+            if hasattr(self._sftp_client, 'open'):
+                try:
+                    async with self._sftp_client.open(remote_path, 'rb') as f:
+                        content = await f.read()
+                    self.last_activity = datetime.now()
+                    logger.info(f"Downloaded {remote_path} to memory using open+read ({len(content)} bytes)")
+                    return content
+                except Exception as open_err:
+                    logger.warning(f"open method failed: {open_err}, trying alternatives")
+            
+            # Method 4: Try other AsyncSSH-style methods by string matching on type
+            try:
+                # Check if this looks like an asyncssh SFTP client
+                client_type = str(type(self._sftp_client)).lower()
+                if 'asyncssh' in client_type or 'sftp' in client_type:
+                    # Try some common methods that might be available
+                    for method_name in ['readfile', 'getfile', 'download', 'read_file', 'fetch']:
+                        if hasattr(self._sftp_client, method_name):
+                            try:
+                                logger.info(f"Trying alternative method: {method_name}")
+                                
+                                if method_name in ['readfile', 'read_file', 'fetch', 'download']:
+                                    # Methods that return content directly
+                                    content = await getattr(self._sftp_client, method_name)(remote_path)
+                                    if content:
+                                        self.last_activity = datetime.now()
+                                        if isinstance(content, str):
+                                            content = content.encode('utf-8') 
+                                        logger.info(f"Downloaded using {method_name} ({len(content)} bytes)")
+                                        return content
+                                else:
+                                    # Methods that write to a file-like object
+                                    file_obj = io.BytesIO()
+                                    await getattr(self._sftp_client, method_name)(remote_path, file_obj)
+                                    file_obj.seek(0)
+                                    content = file_obj.read()
+                                    if content:
+                                        self.last_activity = datetime.now()
+                                        logger.info(f"Downloaded using {method_name} ({len(content)} bytes)")
+                                        return content
+                            except Exception as method_err:
+                                logger.debug(f"Method {method_name} failed: {method_err}")
+            except Exception as type_err:
+                logger.debug(f"Type-based method detection failed: {type_err}")
+                    
+            # Method 5: Use get with a temporary file (least efficient but reliable fallback)
+            temp_file = f"temp_{int(time.time())}.tmp"
+            try:
+                await self._sftp_client.get(remote_path, temp_file)
+                self.last_activity = datetime.now()
+                
+                # Read the temp file
+                with open(temp_file, 'rb') as f:
+                    content = f.read()
+                
+                # Clean up temp file
+                try:
+                    os.remove(temp_file)
+                except Exception as rm_err:
+                    logger.warning(f"Failed to remove temp file {temp_file}: {rm_err}")
+                    
+                logger.info(f"Downloaded {remote_path} to memory using temp file ({len(content)} bytes)")
+                return content
+            except Exception as temp_err:
+                logger.warning(f"Temp file method failed: {temp_err}")
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except:
+                    pass
+            
+            # If we reach here, all methods failed
+            logger.error(f"All download methods failed for {remote_path}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error downloading file {remote_path} to memory: {e}")
+            return None
+            
     async def download_file(self, remote_path: str, local_path: Optional[str] = None) -> Optional[bytes]:
         """Download file from SFTP server
 
@@ -1591,25 +1868,30 @@ class SFTPClient:
             self.operation_count += 1
 
             if local_path:
-                # Download to file
-                await self._sftp_client.get(remote_path, local_path)
-                # Update again after successful operation
-                self.last_activity = datetime.now()
-                logger.info(f"Downloaded {remote_path} to {local_path}")
-                return None
+                # Download to file - try multiple methods
+                try:
+                    await self._sftp_client.get(remote_path, local_path)
+                    # Update again after successful operation
+                    self.last_activity = datetime.now()
+                    logger.info(f"Downloaded {remote_path} to {local_path}")
+                    return None
+                except Exception as get_err:
+                    logger.warning(f"Error using get method: {get_err}, trying alternative methods")
+                    
+                    # Try to download to memory first, then write to file
+                    try:
+                        content = await self._download_to_memory(remote_path)
+                        if content:
+                            with open(local_path, 'wb') as f:
+                                f.write(content)
+                            logger.info(f"Downloaded {remote_path} to {local_path} (memory+write method)")
+                            return None
+                    except Exception as alt_err:
+                        logger.error(f"Failed to download with alternative method: {alt_err}")
+                        return None
             else:
                 # Download to memory
-                file_obj = io.BytesIO()
-                await self._sftp_client.getfo(remote_path, file_obj)
-                # Update again after successful operation
-                self.last_activity = datetime.now()
-
-                # Reset position to beginning
-                file_obj.seek(0)
-                content = file_obj.read()
-
-                logger.info(f"Downloaded {remote_path} to memory ({len(content)} bytes)")
-                return content
+                return await self._download_to_memory(remote_path)
 
         except Exception as e:
             logger.error(f"Failed to download file {remote_path}: {e}")
@@ -1823,8 +2105,12 @@ class SFTPClient:
             logger.debug(f"Error checking if path is a file {path}: {str(e)}")
             return False
 
-    async def get_log_file(self) -> Optional[str]:
+    async def get_log_file(self, server_dir: Optional[str] = None, base_path: Optional[str] = None) -> Optional[str]:
         """Get the Deadside.log file path
+        
+        Args:
+            server_dir: Optional pre-constructed server directory (e.g., "hostname_serverid")
+            base_path: Optional base path override for finding the log file
 
         Returns:
             Optional[str]: Path to Deadside.log if found, None otherwise
@@ -1840,18 +2126,33 @@ class SFTPClient:
             if path_server_id is not None:
                 path_server_id = str(path_server_id)
             
+            # Special case for Tower of Temptation server
+            if self.server_id == "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3" and not str(path_server_id).isdigit():
+                path_server_id = "7020"
+                logger.info(f"Using known ID '7020' for Tower of Temptation server")
+            
             # Log which server ID we're using for path construction
             logger.info(f"Using server ID '{path_server_id}' for path construction in get_log_file")
 
-            # Construct path to logs directory - format: hostname_serverid/Logs/Deadside.log
-            hostname = self.hostname.split(':')[0] if self.hostname else "server" 
-            server_dir = f"{hostname}_{path_server_id}"
+            # Use provided server_dir if available, otherwise construct it
+            if not server_dir:
+                hostname = self.hostname.split(':')[0] if self.hostname else "server" 
+                server_dir = f"{hostname}_{path_server_id}"
+                logger.info(f"Constructed server directory: {server_dir}")
+            else:
+                logger.info(f"Using provided server directory: {server_dir}")
             
-            # For Deadside logs in Tower of Temptation's server structure
-            # The path is always /hostname_serverid/Logs/Deadside.log where serverid is the numeric ID
-            log_path = os.path.join("/", server_dir, "Logs")
-            logger.info(f"Constructed log path: {log_path} using server ID: {path_server_id}")
-            deadside_log = os.path.join(log_path, "Deadside.log")
+            # Use provided base_path if available, otherwise construct it
+            if not base_path:
+                # For Deadside logs in Tower of Temptation's server structure
+                # The path is always /hostname_serverid/Logs/Deadside.log where serverid is the numeric ID
+                base_path = os.path.join("/", server_dir, "Logs")
+                logger.info(f"Constructed log path: {base_path}")
+            else:
+                logger.info(f"Using provided log path: {base_path}")
+                
+            logger.info(f"Final path construction: server_dir={server_dir}, base_path={base_path}, server_id={path_server_id}")
+            deadside_log = os.path.join(base_path, "Deadside.log")
 
             # Log the exact path we're checking
             logger.info(f"Looking for Deadside.log at path: {deadside_log}")
@@ -1867,7 +2168,7 @@ class SFTPClient:
                 logger.info(f"Found Deadside.log at: {deadside_log}")
                 return deadside_log
             except Exception as e:
-                logger.warning(f"Deadside.log not found in {log_path}: {e}")
+                logger.warning(f"Deadside.log not found in {base_path}: {e}")
                 return None
 
         except Exception as e:
@@ -1955,7 +2256,7 @@ class SFTPClient:
                     logger.info(f"Reconnected during recursive search in {directory}")
                 else:
                     logger.error(f"Failed to reconnect during recursive search in {directory}")
-                    return
+                    return result
 
             # List directory contents with retry logic
             max_attempts = 2
@@ -1978,12 +2279,12 @@ class SFTPClient:
                         await asyncio.sleep(0.5)  # Brief delay before retry
                     else:
                         logger.error(f"All attempts to list directory {directory} failed")
-                        return
+                        return result
 
             # Check if we ultimately found any entries
             if not entries:
                 logger.debug(f"No entries found in directory {directory} after all attempts")
-                return
+                return result
 
             # Process all entries
             for entry in entries:
@@ -2019,6 +2320,9 @@ class SFTPClient:
         except Exception as e:
             logger.error(f"Failed to process directory {directory}: {e}")
             logger.debug(f"Directory error details:\n{traceback.format_exc()}")
+            
+        # Make sure we always return the result list
+        return result
 
     @with_operation_tracking("find_csv")
     @retryable(max_retries=2, delay=1.0, backoff=1.5, 
