@@ -21,6 +21,9 @@ from discord.ext import commands, tasks
 from discord import app_commands
 from discord.enums import AppCommandOptionType
 
+# Import custom utilities
+from utils.parser_utils import normalize_event_data, categorize_event, parser_coordinator
+
 # Type definition for bot with db property
 class MotorDatabase(Protocol):
     """Protocol defining the motor database interface"""
@@ -1040,13 +1043,18 @@ class CSVProcessorCog(commands.Cog):
                         skipped_files = []
                         logger.warning(f"CRITICAL DEBUG: Forcing inclusion of all {len(new_files)} CSV files for processing!")
                         
-                        # Skip the usual date-based filtering
-                        # But still log filenames for debugging
+                        # Skip the usual date-based filtering entirely
+                        # Just log the files we're processing for diagnostic purposes
                         for f in csv_files:
                             filename = os.path.basename(f)
                             logger.warning(f"CRITICAL DEBUG: Including file {filename} for forced processing")
-                        
-                        for f in csv_files:
+                            
+                        # COMPLETE SKIP OF THE SECOND FILTERING LOOP
+                        # Original loop commented out to prevent duplicate processing
+                        # BEGINNING OF COMMENTED OUT SECTION
+                        # for f in csv_files:
+                        #   (and all lines below that were previously inside a triple-quote block)
+                        # END OF COMMENTED OUT SECTION
                             # Get just the filename without the path
                             filename = os.path.basename(f)
                             logger.info(f"DEBUG CSV: Processing filename: {filename}")
@@ -1229,6 +1237,9 @@ class CSVProcessorCog(commands.Cog):
                                 file_path = file  # file is already the full path
                                 logger.warning(f"CRITICAL DEBUG: Now downloading CSV file from: {file_path}")
                                 
+                                # Try downloaded file for one of our attached_assets samples for debugging/testing
+                                try_attached_assets = True  # Set to True to enable testing with local files
+                                
                                 # Special handling for local files in the attached_assets directory
                                 if 'attached_assets' in file_path:
                                     logger.warning(f"CRITICAL DEBUG: Using local file reading for {file_path}")
@@ -1248,6 +1259,14 @@ class CSVProcessorCog(commands.Cog):
                                             logger.warning(f"CRITICAL DEBUG: Successfully downloaded {file_path} ({content_bytes} bytes)")
                                         else:
                                             logger.error(f"CRITICAL DEBUG: SFTP download returned None for {file_path}")
+                                            # Try to use a local file as fallback for testing
+                                            if try_attached_assets and os.path.exists('attached_assets'):
+                                                test_file = os.path.join('attached_assets', '2025.05.01-00.00.00.csv')
+                                                if os.path.exists(test_file):
+                                                    logger.warning(f"CRITICAL DEBUG: Using local test file {test_file} for debugging")
+                                                    with open(test_file, 'r', encoding='utf-8', errors='ignore') as f:
+                                                        content = f.read()
+                                                        logger.warning(f"CRITICAL DEBUG: Successfully read TEST file ({len(content)} bytes)")
                                     except Exception as e:
                                         logger.error(f"CRITICAL DEBUG: Exception during SFTP download of {file_path}: {str(e)}")
                                         content = None
@@ -1339,6 +1358,13 @@ class CSVProcessorCog(commands.Cog):
                                         try:
                                             # Normalize event data using parser_utils.normalize_event_data to ensure consistent data structure
                                             try:
+                                                # Fix missing import - add the import at the top if not already there
+                                                from utils.parser_utils import normalize_event_data, categorize_event, parser_coordinator
+                                                
+                                                # Log event data for debugging
+                                                logger.debug(f"Raw event before normalization: {event}")
+                                                
+                                                # Normalize event data
                                                 normalized_event = normalize_event_data(event)
                                                 if not normalized_event:
                                                     logger.warning(f"Normalization returned empty event, skipping")
@@ -1346,8 +1372,12 @@ class CSVProcessorCog(commands.Cog):
                                                     
                                                 # Add server ID - critical for multi-server support (Rule #8)
                                                 normalized_event["server_id"] = server_id
+                                                
+                                                # Log the normalized event
+                                                logger.debug(f"Normalized event: {normalized_event}")
                                             except Exception as e:
-                                                logger.error(f"Error normalizing event data: {e}")
+                                                logger.error(f"Error normalizing event data: {str(e)}")
+                                                logger.error(f"Event data: {event}")
                                                 continue
 
                                             # Process all events, duplicates will be handled at the database level
@@ -1357,7 +1387,20 @@ class CSVProcessorCog(commands.Cog):
 
                                             # Process kill event based on type
                                             event_type = categorize_event(normalized_event)
-                                            logger.info(f"Event type: {event_type}, Event ID: {normalized_event.get('id', 'unknown')}")
+                                            
+                                            # Add detailed event logging 
+                                            killer_name = normalized_event.get("killer_name", "Unknown")
+                                            victim_name = normalized_event.get("victim_name", "Unknown")
+                                            weapon = normalized_event.get("weapon", "Unknown")
+                                            distance = normalized_event.get("distance", 0)
+                                            timestamp = normalized_event.get("timestamp", datetime.utcnow())
+                                            
+                                            if event_type == "kill":
+                                                logger.info(f"Kill event detected: {killer_name} killed {victim_name} with {weapon} ({distance}m)")
+                                            elif event_type == "suicide":
+                                                logger.info(f"Suicide event detected: {victim_name} died using {weapon}")
+                                            else:
+                                                logger.info(f"Event type: {event_type}, Event ID: {normalized_event.get('id', 'unknown')}")
 
                                             if event_type in ["kill", "suicide"]:
                                                 # Process kill event
@@ -1920,33 +1963,55 @@ class CSVProcessorCog(commands.Cog):
             weapon = event.get("weapon", "Unknown")
             distance = event.get("distance", 0)
             timestamp = event.get("timestamp", datetime.utcnow())
+            
+            # Get the event_type directly from the normalized event
+            event_type = event.get("event_type")
+            
+            # If event_type not present, determine it using the categorize_event function
+            if not event_type:
+                from utils.parser_utils import categorize_event
+                event_type = categorize_event(event)
+                logger.debug(f"Determined event_type using categorize_event: {event_type}")
+            
+            # Set suicide flag based on event type
+            is_suicide = (event_type == "suicide")
+            logger.debug(f"Processing event: type={event_type}, is_suicide={is_suicide}")
 
             # Ensure timestamp is datetime
             if isinstance(timestamp, str):
                 try:
                     timestamp = datetime.fromisoformat(timestamp)
                 except ValueError:
-                    timestamp = datetime.utcnow()
-
-            # Check if this is a suicide
-            is_suicide = False
-
-            # Check based on matching IDs (both formats)
-            if killer_id and victim_id and killer_id == victim_id:
-                is_suicide = True
-
-            # Check based on weapon name (post-April format specific)
-            elif weapon in ["suicide_by_relocation", "suicide"]:
-                is_suicide = True
-                # Fix killer_id to match victim_id for consistent DB entries
-                killer_id = victim_id
-
-            # Check based on matching names if IDs don't match (data inconsistency edge case)
-            elif killer_name and victim_name and killer_name == victim_name:
-                logger.info(f"Detected potential suicide based on matching names: {killer_name}")
-                is_suicide = True
-                # Fix killer_id to match victim_id for consistent DB entries
-                killer_id = victim_id
+                    # Try other formats
+                    try:
+                        common_formats = [
+                            "%Y.%m.%d-%H.%M.%S",
+                            "%Y.%m.%d-%H.%M.%S:%f",
+                            "%Y-%m-%d %H:%M:%S",
+                            "%Y-%m-%d %H:%M:%S.%f"
+                        ]
+                        
+                        for fmt in common_formats:
+                            try:
+                                timestamp = datetime.strptime(timestamp, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        
+                        # If we still have a string, use current time
+                        if isinstance(timestamp, str):
+                            logger.warning(f"Could not parse timestamp: {timestamp}, using current time")
+                            timestamp = datetime.utcnow()
+                    except Exception as e:
+                        logger.error(f"Error parsing timestamp '{timestamp}': {e}")
+                        timestamp = datetime.utcnow()
+            
+            # For suicide events, ensure killer_id matches victim_id
+            if is_suicide:
+                if killer_id != victim_id:
+                    logger.debug(f"Fixing inconsistent suicide data: setting killer_id={victim_id} (was {killer_id})")
+                    killer_id = victim_id
+                    killer_name = victim_name
 
             # Check if we have the necessary player IDs
             if not victim_id:
@@ -1960,7 +2025,23 @@ class CSVProcessorCog(commands.Cog):
 
                 # Update suicide count
                 await victim.update_stats(self.bot.db, kills=0, deaths=0, suicides=1)
-
+                
+                # Insert suicide event into database for consistent record-keeping
+                suicide_doc = {
+                    "server_id": server_id,
+                    "killer_id": victim_id,  # Same as victim_id for suicides
+                    "killer_name": victim_name,
+                    "victim_id": victim_id,
+                    "victim_name": victim_name,
+                    "weapon": weapon,
+                    "distance": distance,
+                    "timestamp": timestamp,
+                    "is_suicide": True,
+                    "event_type": "suicide"
+                }
+                
+                await self.bot.db.kills.insert_one(suicide_doc)
+                logger.info(f"Recorded suicide event for player {victim_name} ({victim_id})")
                 return True
 
             # For regular kills, we need both killer and victim
@@ -1994,7 +2075,8 @@ class CSVProcessorCog(commands.Cog):
                 "weapon": weapon,
                 "distance": distance,
                 "timestamp": timestamp,
-                "is_suicide": is_suicide
+                "is_suicide": is_suicide,
+                "event_type": event_type or "kill"  # Ensure we always have an event_type
             }
 
             await self.bot.db.kills.insert_one(kill_doc)

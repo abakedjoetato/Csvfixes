@@ -178,19 +178,58 @@ class CSVParser:
             with open(file_path, "r", encoding="latin-1") as file:
                 return self._parse_csv_file(file, file_path=file_path, only_new_lines=only_new_lines)
 
-    def _parse_csv_file(self, file: TextIO, file_path: str = None, only_new_lines: bool = False) -> List[Dict[str, Any]]:
+    def _parse_csv_file(self, file: Union[TextIO, BinaryIO], file_path: str = None, only_new_lines: bool = False) -> List[Dict[str, Any]]:
         """Parse CSV file and return list of events
 
         Args:
-            file: File-like object
+            file: File-like object (can be text or binary)
             file_path: Path to the file (used for tracking processed lines)
             only_new_lines: If True, only parse lines that haven't been processed before
 
         Returns:
             List[Dict]: List of parsed event dictionaries
         """
+        # Handle possible None input
+        if file is None:
+            logger.error(f"Null file object provided to CSV parser for {file_path or 'unknown path'}")
+            return []
+            
+        # Check if file object has read method
+        if not hasattr(file, 'read') or not callable(getattr(file, 'read')):
+            logger.error(f"Invalid file object provided (no read method) for {file_path or 'unknown path'}")
+            return []
+            
         # Check for empty file by trying to read a sample
-        file_content = file.read(1000)  # Read a sample to detect content
+        try:
+            file_content = file.read(4096)  # Read a larger sample to detect content
+            
+            # Reset file position for subsequent reads
+            if hasattr(file, 'seek') and callable(getattr(file, 'seek')):
+                file.seek(0)
+            else:
+                logger.error(f"File object does not support seek operation, cannot process {file_path or 'unknown path'}")
+                return []
+                
+            # Handle binary content if needed
+            if isinstance(file_content, bytes):
+                try:
+                    file_content = file_content.decode('utf-8', errors='replace')
+                    logger.info(f"Converted binary content to text for {file_path or 'unknown path'}")
+                except Exception as e:
+                    logger.error(f"Error decoding binary content: {e}")
+                    return []
+                    
+            # Handle unexpected content types
+            if not isinstance(file_content, str):
+                try:
+                    file_content = str(file_content)
+                    logger.warning(f"Converted non-string content of type {type(file_content)} to string")
+                except Exception as e:
+                    logger.error(f"Cannot convert content to string: {e}")
+                    return []
+        except Exception as e:
+            logger.error(f"Error reading from file: {str(e)}")
+            return []
         
         # If file is empty or just whitespace, return empty list
         if not file_content or not file_content.strip():
@@ -204,7 +243,7 @@ class CSVParser:
         
         # Use the most frequent delimiter if it appears significantly
         best_delimiter = self.separator  # Default
-        max_count = delimiters[self.separator]
+        max_count = delimiters.get(self.separator, 0)
         
         for d, count in delimiters.items():
             if count > max_count:
@@ -217,6 +256,12 @@ class CSVParser:
             # We'll still try to parse with default separator, but log the warning
             
         logger.info(f"Detected delimiter: '{best_delimiter}' (counts: {delimiters})")
+        
+        # Log first few lines for debugging
+        sample_lines = file_content.split('\n')[:5]
+        logger.info(f"Sample content from {file_path or 'unknown'} (first 5 lines):")
+        for idx, line in enumerate(sample_lines):
+            logger.info(f"Line {idx+1}: {line[:100]}{'...' if len(line) > 100 else ''}")
         
         # Reset file position
         file.seek(0)
