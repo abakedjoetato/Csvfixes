@@ -7,6 +7,7 @@ This cog provides:
 3. Admin commands for managing CSV processing
 """
 import asyncio
+import io
 import logging
 import os
 import re
@@ -92,12 +93,11 @@ class CSVProcessorCog(commands.Cog):
             except Exception as e:
                 logger.error(f"Error disconnecting SFTP for server {server_id}: {e}")
 
-    @tasks.loop(minutes=15.0)  # Reduced frequency to minimize resource usage
+    @tasks.loop(minutes=5.0)  # Set back to 5 minutes as per requirements
     async def process_csv_files_task(self):
         """Background task for processing CSV files
 
-        This task runs every 15 minutes (reduced from 5) to check for new CSV files 
-        while maintaining lower resource usage.
+        This task runs every 5 minutes to check for new CSV files and process them promptly.
         """
         if self.is_processing:
             logger.debug("Skipping CSV processing - already running")
@@ -1077,7 +1077,54 @@ class CSVProcessorCog(commands.Cog):
 
                         logger.info(f"Starting to process {len(new_files)} CSV files")
                         
-                        for file in new_files:
+                        # Sort files by date to ensure we process in chronological order
+                        # Extract date from filename for proper sorting
+                        def get_file_date(file_path):
+                            try:
+                                # Extract date portion from path like .../2025.05.06-00.00.00.csv
+                                file_name = os.path.basename(file_path)
+                                date_part = file_name.split('.csv')[0]
+                                return datetime.strptime(date_part, "%Y.%m.%d-%H.%M.%S")
+                            except (ValueError, IndexError):
+                                # If parsing fails, return a default old date
+                                logger.warning(f"Unable to parse date from filename: {file_path}")
+                                return datetime(2000, 1, 1)
+                                
+                        # Sort files by their embedded date
+                        sorted_files = sorted(new_files, key=get_file_date)
+                        logger.critical(f"CSV_DEBUG_MARKER: Sorted files: {sorted_files}")
+                        
+                        # Determine which files to process based on historical vs. regular processing
+                        # - Historical processor will read all CSV files
+                        # - Regular killfeed parser will only read new lines from the newest CSV
+                        is_historical_mode = False
+                        if start_date:
+                            days_diff = (datetime.now() - start_date).days
+                            is_historical_mode = days_diff >= 7
+                            logger.critical(f"CSV_DEBUG_MARKER: Start date is {start_date}, days diff is {days_diff}")
+                        else:
+                            logger.critical("CSV_DEBUG_MARKER: No start date provided")
+                            
+                        if is_historical_mode:
+                            logger.critical("CSV_DEBUG_MARKER: Running in historical mode - processing all files in full")
+                            files_to_process = sorted_files
+                            only_new_lines = False  # Process all lines in historical mode
+                        else:
+                            # Regular processing - process all files but only new lines
+                            if sorted_files:
+                                logger.critical(f"CSV_DEBUG_MARKER: Running in killfeed mode - processing all files but only new lines")
+                                # Since we're testing and fixing, process all files instead of just the newest
+                                files_to_process = sorted_files
+                                only_new_lines = True  # Only process new lines
+                            else:
+                                logger.critical("CSV_DEBUG_MARKER: No files to process")
+                                files_to_process = []
+                                only_new_lines = False
+                                
+                        logger.critical(f"CSV_DEBUG_MARKER: Mode selection: Historical = {is_historical_mode}, " + 
+                                     f"start_date = {start_date}, files to process = {len(files_to_process)}")
+                        
+                        for file in files_to_process:
                             try:
                                 # Download file content - use the correct path
                                 file_path = file  # file is already the full path
@@ -1096,7 +1143,14 @@ class CSVProcessorCog(commands.Cog):
                                     content = await sftp.download_file(file_path)
 
                                 if content:
-                                    logger.info(f"Downloaded content type: {type(content)}, length: {len(content) if hasattr(content, '__len__') else 'unknown'}")
+                                    content_length = len(content) if hasattr(content, '__len__') else 0
+                                    logger.info(f"Downloaded content type: {type(content)}, length: {content_length}")
+                                    
+                                    # Verify the content is not empty
+                                    if content_length == 0:
+                                        logger.warning(f"Empty content downloaded from {file_path} - skipping processing")
+                                        continue
+                                    
                                     # Handle different types of content returned from download_file
                                     if isinstance(content, bytes):
                                         # Normal case - bytes returned
@@ -1113,13 +1167,33 @@ class CSVProcessorCog(commands.Cog):
                                         # Handle any other case by converting to string
                                         decoded_content = str(content)
                                     
+                                    # Verify decoded content has actual substance
+                                    if not decoded_content or len(decoded_content.strip()) == 0:
+                                        logger.warning(f"Empty decoded content from {file_path} - skipping processing")
+                                        continue
+                                    
                                     # Log a sample of the content for debugging
                                     sample = decoded_content[:200] + "..." if len(decoded_content) > 200 else decoded_content
                                     logger.info(f"CSV content sample: {sample}")
                                     
-                                    # Process content
-                                    events = self.csv_parser.parse_csv_data(decoded_content)
-                                    logger.info(f"Parsed {len(events)} events from CSV file")
+                                    # Process content - determine if we should only process new lines
+                                    events = []
+                                    
+                                    # Convert decoded content to StringIO for parsing
+                                    content_io = io.StringIO(decoded_content)
+                                    
+                                    if only_new_lines:
+                                        # Only process new lines - use the tracked line counter
+                                        logger.critical(f"CSV_DEBUG_MARKER: Processing only new lines from file: {file_path}")
+                                        events = self.csv_parser._parse_csv_file(content_io, file_path=file_path, only_new_lines=True)
+                                        logger.info(f"Processed only new lines from file: {file_path}")
+                                    else:
+                                        # Process all lines (historical mode)
+                                        logger.critical(f"CSV_DEBUG_MARKER: Processing all lines from file: {file_path}")
+                                        events = self.csv_parser._parse_csv_file(content_io, file_path=file_path, only_new_lines=False)
+                                        logger.info(f"Processed all lines from file: {file_path}")
+                                        
+                                    logger.critical(f"CSV_DEBUG_MARKER: Parsed {len(events)} events from file {file_path}")
 
                                     # Normalize and deduplicate events
                                     processed_count = 0

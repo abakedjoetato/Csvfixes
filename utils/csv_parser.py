@@ -104,11 +104,15 @@ class CSVParser:
         # Initialize caches
         self._event_cache = {}
         self._player_stats_cache = {}
+        
+        # Track last processed line for each file
+        self._last_processed_line_count = {}  # {file_path: line_count}
 
     def clear_cache(self):
         """Clear all parser caches"""
         self._event_cache = {}
         self._player_stats_cache = {}
+        self._last_processed_line_count = {}  # Reset line tracking
         logger.info("CSV parser cache cleared")
 
     def parse_csv_data(self, data: Union[str, bytes]) -> List[Dict[str, Any]]:
@@ -156,36 +160,43 @@ class CSVParser:
         finally:
             csv_file.close()
 
-    def parse_csv_file(self, file_path: str) -> List[Dict[str, Any]]:
+    def parse_csv_file(self, file_path: str, only_new_lines: bool = False) -> List[Dict[str, Any]]:
         """Parse CSV file and return list of events
 
         Args:
             file_path: Path to CSV file
+            only_new_lines: If True, only parse lines that haven't been processed before
 
         Returns:
             List[Dict]: List of parsed event dictionaries
         """
         try:
             with open(file_path, "r", encoding="utf-8") as file:
-                return self._parse_csv_file(file)
+                return self._parse_csv_file(file, file_path=file_path, only_new_lines=only_new_lines)
         except UnicodeDecodeError:
             # Try with different encoding
             with open(file_path, "r", encoding="latin-1") as file:
-                return self._parse_csv_file(file)
+                return self._parse_csv_file(file, file_path=file_path, only_new_lines=only_new_lines)
 
-    def _parse_csv_file(self, file: TextIO) -> List[Dict[str, Any]]:
+    def _parse_csv_file(self, file: TextIO, file_path: str = None, only_new_lines: bool = False) -> List[Dict[str, Any]]:
         """Parse CSV file and return list of events
 
         Args:
             file: File-like object
+            file_path: Path to the file (used for tracking processed lines)
+            only_new_lines: If True, only parse lines that haven't been processed before
 
         Returns:
             List[Dict]: List of parsed event dictionaries
         """
-        # Create CSV reader - Try to handle different formats and delimiters
-        # First try to detect the delimiter by reading a small sample
-        file_content = file.read(1000)  # Read a sample to detect the delimiter
+        # Check for empty file by trying to read a sample
+        file_content = file.read(1000)  # Read a sample to detect content
         
+        # If file is empty or just whitespace, return empty list
+        if not file_content or not file_content.strip():
+            logger.warning(f"Empty or blank CSV file detected: {file_path or 'unknown'}")
+            return []
+            
         # Count occurrences of potential delimiters
         delimiters = {';': 0, ',': 0, '\t': 0}
         for d in delimiters:
@@ -200,6 +211,11 @@ class CSVParser:
                 max_count = count
                 best_delimiter = d
         
+        # If no delimiters found at all, this might not be a valid CSV
+        if max_count == 0:
+            logger.warning(f"No valid delimiters found in file: {file_path or 'unknown'} - content might not be CSV")
+            # We'll still try to parse with default separator, but log the warning
+            
         logger.info(f"Detected delimiter: '{best_delimiter}' (counts: {delimiters})")
         
         # Reset file position
@@ -227,85 +243,121 @@ class CSVParser:
             file.seek(0)
             csv_reader = csv.reader(file, delimiter=best_delimiter)
 
+        # Get or initialize line counter for this file
+        last_processed_line = 0
+        if file_path and only_new_lines and file_path in self._last_processed_line_count:
+            last_processed_line = self._last_processed_line_count[file_path]
+            logger.info(f"Starting processing from line {last_processed_line} in file {file_path}")
+        else:
+            logger.info(f"Processing entire file {file_path or 'unknown'} (only_new_lines={only_new_lines})")
+        
         # Parse rows
         events = []
-        for row in csv_reader:
-            # Skip empty rows
-            if row is None or len(row) < 6:  # Minimum required fields for a kill event
-                continue
-
-            # Check if this might be a pre-April (7 columns) or post-April (9 columns) format
-            row_format = None
-            if len(row) >= 9:  # Has console fields - post-April format
-                row_format = "post_april"
-            elif len(row) >= 7:  # Basic kill event - pre-April format
-                row_format = "pre_april"
-            else:
-                # Unrecognized format, but we'll still try to parse with defaults
-                row_format = "unknown"
-
-            # Create event dictionary
-            event = {}
-            for i, column in enumerate(self.columns):
-                if i < len(row):
-                    event[column] = row[i].strip()
+        current_line = 0
+        
+        try:
+            for row in csv_reader:
+                current_line += 1
+                
+                # Skip already processed lines if only_new_lines is True
+                if only_new_lines and current_line <= last_processed_line:
+                    continue
+                    
+                # Skip empty rows
+                if row is None or len(row) < 6:  # Minimum required fields for a kill event
+                    continue
+                    
+                logger.debug(f"Processing row {current_line} with {len(row)} fields: {row[:3]}...")
+                
+                # Process the row data
+                
+                # Check if this might be a pre-April (7 columns) or post-April (9 columns) format
+                row_format = None
+                if len(row) >= 9:  # Has console fields - post-April format
+                    row_format = "post_april"
+                elif len(row) >= 7:  # Basic kill event - pre-April format
+                    row_format = "pre_april"
                 else:
-                    # For missing fields, use appropriate defaults based on the field
-                    if column in ("killer_console", "victim_console") and row_format == "pre_april":
-                        event[column] = "Unknown"  # Pre-April format doesn't include console info
+                    # Unrecognized format, but we'll still try to parse with defaults
+                    row_format = "unknown"
+                
+                # Create event dictionary
+                event = {}
+                for i, column in enumerate(self.columns):
+                    if i < len(row):
+                        event[column] = row[i].strip()
                     else:
-                        event[column] = ""
+                        # For missing fields, use appropriate defaults based on the field
+                        if column in ("killer_console", "victim_console") and row_format == "pre_april":
+                            event[column] = "Unknown"  # Pre-April format doesn't include console info
+                        else:
+                            event[column] = ""
+                
+                # Log format detection for debugging - uncomment if needed
+                # logger.debug(f"Parsed row with format {row_format}, fields: {len(row)}, event keys: {list(event.keys())}")
 
-            # Log format detection for debugging - uncomment if needed
-            # logger.debug(f"Parsed row with format {row_format}, fields: {len(row)}, event keys: {list(event.keys())}")
-
-            # Convert datetime column with multiple format support
-            if self.datetime_column in event:
-                try:
-                    # Try primary format first
-                    event[self.datetime_column] = datetime.strptime(
-                        event[self.datetime_column], 
-                        self.datetime_format
-                    )
-                except (ValueError, TypeError):
-                    # Try alternative formats if primary fails
-                    timestamp_str = event[self.datetime_column]
-                    parsed = False
-
-                    # Try these common formats
-                    alternative_formats = [
-                        "%Y.%m.%d-%H.%M.%S",      # 2025.03.27-10.42.18
-                        "%Y-%m-%d %H:%M:%S",      # 2025-03-27 10:42:18
-                        "%Y.%m.%d %H:%M:%S",      # 2025.03.27 10:42:18
-                        "%Y/%m/%d %H:%M:%S",      # 2025/03/27 10:42:18
-                        "%d.%m.%Y-%H.%M.%S",      # 27.03.2025-10.42.18
-                        "%d.%m.%Y %H:%M:%S"       # 27.03.2025 10:42:18
-                    ]
-
-                    for fmt in alternative_formats:
-                        try:
-                            event[self.datetime_column] = datetime.strptime(timestamp_str, fmt)
-                            parsed = True
-                            logger.debug(f"Parsed timestamp {timestamp_str} with format {fmt}")
-                            break
-                        except (ValueError, TypeError):
-                            continue
-
-                    if not parsed:
-                        logger.warning(f"Failed to parse timestamp: {timestamp_str}")
-                        # Keep original string if all parsing attempts fail
-
-            # Convert numeric columns
-            if self.format_name == "deadside":
-                # Convert distance to float
-                if "distance" in event:
+                # Convert datetime column with multiple format support
+                if self.datetime_column in event:
                     try:
-                        event["distance"] = float(event["distance"])
+                        # Try primary format first
+                        event[self.datetime_column] = datetime.strptime(
+                            event[self.datetime_column], 
+                            self.datetime_format
+                        )
                     except (ValueError, TypeError):
-                        event["distance"] = 0.0
+                        # Try alternative formats if primary fails
+                        timestamp_str = event[self.datetime_column]
+                        parsed = False
 
-            # Add event to list
-            events.append(event)
+                        # Try these common formats
+                        alternative_formats = [
+                            "%Y.%m.%d-%H.%M.%S",      # 2025.03.27-10.42.18
+                            "%Y-%m-%d %H:%M:%S",      # 2025-03-27 10:42:18
+                            "%Y.%m.%d %H:%M:%S",      # 2025.03.27 10:42:18
+                            "%Y/%m/%d %H:%M:%S",      # 2025/03/27 10:42:18
+                            "%d.%m.%Y-%H.%M.%S",      # 27.03.2025-10.42.18
+                            "%d.%m.%Y %H:%M:%S"       # 27.03.2025 10:42:18
+                        ]
+
+                        for fmt in alternative_formats:
+                            try:
+                                event[self.datetime_column] = datetime.strptime(timestamp_str, fmt)
+                                parsed = True
+                                logger.debug(f"Parsed timestamp {timestamp_str} with format {fmt}")
+                                break
+                            except (ValueError, TypeError):
+                                continue
+
+                        if not parsed:
+                            logger.warning(f"Failed to parse timestamp: {timestamp_str}")
+                            # Keep original string if all parsing attempts fail
+
+                # Convert numeric columns
+                if self.format_name == "deadside":
+                    # Convert distance to float
+                    if "distance" in event:
+                        try:
+                            event["distance"] = float(event["distance"])
+                        except (ValueError, TypeError):
+                            event["distance"] = 0.0
+
+                # Add event to list
+                events.append(event)
+        except Exception as e:
+            logger.error(f"Error in CSV processing at line {current_line}: {str(e)}")
+            # Return the events that were parsed successfully so far
+            return events
+        
+        # Update last processed line count if we're tracking this file
+        if file_path and current_line > 0:
+            self._last_processed_line_count[file_path] = current_line
+            logger.info(f"Updated last processed line for {file_path} to {current_line}")
+            
+        # Log summary of what we processed
+        if only_new_lines:
+            logger.info(f"Processed {len(events)} new events from {current_line - last_processed_line} new lines in {file_path or 'unknown'}")
+        else:
+            logger.info(f"Processed {len(events)} events from entire file {file_path or 'unknown'}")
 
         return events
 

@@ -101,12 +101,11 @@ class LogProcessorCog(commands.Cog):
             except Exception as e:
                 logger.error(f"Error disconnecting SFTP for server {server_id}: {e}")
 
-    @tasks.loop(minutes=2.0)  # Reduced frequency from 1min to 2min to save resources
+    @tasks.loop(minutes=3.0)  # Set to 3 minutes as per requirements
     async def process_logs_task(self):
         """Background task for processing game log files
 
-        This task runs every 2 minutes (reduced from 1) to check for new log entries 
-        while maintaining lower resource usage.
+        This task runs every 3 minutes to check for new log entries in game server logs.
         """
         if self.is_processing:
             logger.debug("Skipping log processing - already running")
