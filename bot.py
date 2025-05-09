@@ -491,7 +491,13 @@ async def run_bot():
                                     )
                                     bot._background_tasks[task_name] = new_task
                             else:
-                                logger.warning(f"Background task {task_name} completed unexpectedly")
+                                # Check if this is a one-time task that's meant to complete
+                                if task_name.startswith("historical_parse"):
+                                    logger.info(f"One-time task {task_name} completed successfully")
+                                    # Clear the task from the dictionary since it's done
+                                    bot._background_tasks[task_name] = None
+                                else:
+                                    logger.warning(f"Background task {task_name} completed unexpectedly")
                 except Exception as e:
                     logger.error(f"Error in background task monitor: {e}")
                 
