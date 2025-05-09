@@ -16,26 +16,41 @@ logger = logging.getLogger(__name__)
 
 async def main():
     """Main entry point"""
-    # Import bot after logging is configured
-    from bot import bot, initialize_bot
+    # Import and initialize database directly
+    from utils.database import DatabaseManager
+    from utils.server_identity import get_server_id_mappings
     
-    # Initialize bot and database
-    logger.info("Initializing bot...")
-    await initialize_bot()
+    # Initialize database
+    logger.info("Initializing database...")
+    db_manager = DatabaseManager()
+    await db_manager.initialize()
     
-    if not bot.db:
+    if not db_manager.db:
         logger.error("Database not initialized")
         return
+        
+    # Get server mappings
+    logger.info("Loading server mappings...")
+    try:
+        server_mappings = await get_server_id_mappings(db_manager.db)
+        logger.info(f"Loaded {len(server_mappings)} server mappings:")
+        for uuid, original_id in server_mappings.items():
+            logger.info(f"  UUID: {uuid} -> Original ID: {original_id}")
+    except Exception as e:
+        logger.error(f"Error loading server mappings: {e}")
+        server_mappings = {}
     
     # List server configurations from all collections
     logger.info("Listing server configurations...")
     
+    db = db_manager.db
+    
     # From servers collection
     logger.info("Servers from 'servers' collection:")
-    servers_count = await bot.db.servers.count_documents({})
+    servers_count = await db.servers.count_documents({})
     logger.info(f"Found {servers_count} servers")
     
-    async for server in bot.db.servers.find({}):
+    async for server in db.servers.find({}):
         server_id = server.get("_id", "unknown")
         server_name = server.get("name", "Unknown")
         hostname = server.get("hostname", "Unknown")
@@ -44,10 +59,10 @@ async def main():
     
     # From game_servers collection
     logger.info("\nServers from 'game_servers' collection:")
-    game_servers_count = await bot.db.game_servers.count_documents({})
+    game_servers_count = await db.game_servers.count_documents({})
     logger.info(f"Found {game_servers_count} game servers")
     
-    async for server in bot.db.game_servers.find({}):
+    async for server in db.game_servers.find({}):
         server_id = server.get("server_id", "unknown")
         server_name = server.get("name", "Unknown")
         hostname = server.get("hostname", "Unknown")
@@ -56,10 +71,10 @@ async def main():
     
     # From guilds collection (embedded servers)
     logger.info("\nServers from 'guilds' collection (embedded):")
-    guilds_count = await bot.db.guilds.count_documents({})
+    guilds_count = await db.guilds.count_documents({})
     logger.info(f"Found {guilds_count} guilds")
     
-    async for guild in bot.db.guilds.find({}):
+    async for guild in db.guilds.find({}):
         guild_id = guild.get("_id", "unknown")
         guild_name = guild.get("name", "Unknown")
         logger.info(f"Guild: {guild_name} (ID: {guild_id})")
@@ -76,34 +91,29 @@ async def main():
         else:
             logger.info("  Guild has no embedded servers")
     
-    # Look for Tower of Temptation server
-    logger.info("\nLooking for Tower of Temptation server...")
+    # Look for Emeralds Killfeed server
+    logger.info("\nLooking for Emeralds Killfeed servers...")
     
-    # Try new UUID
-    tot_server = await bot.db.servers.find_one({"_id": "1056852d-05f9-4e5e-9e88-012c2870c042"})
-    if tot_server:
-        logger.info(f"Found Tower of Temptation server with new UUID: {tot_server.get('_id')}")
-        logger.info(f"Name: {tot_server.get('name')}")
-        logger.info(f"Hostname: {tot_server.get('hostname')}")
-        logger.info(f"Original ID: {tot_server.get('original_server_id', 'Not set')}")
+    emerald_servers = await db.servers.find({"original_server_id": "7020"}).to_list(10)
+    if emerald_servers:
+        logger.info(f"Found {len(emerald_servers)} Emeralds Killfeed servers with original ID 7020")
+        for server in emerald_servers:
+            logger.info(f"  UUID: {server.get('_id')}")
+            logger.info(f"  Name: {server.get('name')}")
+            logger.info(f"  Hostname: {server.get('hostname')}")
+            logger.info(f"  Original ID: {server.get('original_server_id', 'Not set')}")
     else:
-        # Try old UUID
-        tot_server = await bot.db.servers.find_one({"_id": "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3"})
-        if tot_server:
-            logger.info(f"Found Tower of Temptation server with old UUID: {tot_server.get('_id')}")
-            logger.info(f"Name: {tot_server.get('name')}")
-            logger.info(f"Hostname: {tot_server.get('hostname')}")
-            logger.info(f"Original ID: {tot_server.get('original_server_id', 'Not set')}")
+        # Try by name
+        emerald_servers = await db.servers.find({"name": {"$regex": "Emerald", "$options": "i"}}).to_list(10)
+        if emerald_servers:
+            logger.info(f"Found {len(emerald_servers)} Emeralds servers by name")
+            for server in emerald_servers:
+                logger.info(f"  UUID: {server.get('_id')}")
+                logger.info(f"  Name: {server.get('name')}")
+                logger.info(f"  Hostname: {server.get('hostname')}")
+                logger.info(f"  Original ID: {server.get('original_server_id', 'Not set')}")
         else:
-            # Try by name
-            tot_server = await bot.db.servers.find_one({"name": {"$regex": "Tower.*Temptation", "$options": "i"}})
-            if tot_server:
-                logger.info(f"Found Tower of Temptation server by name: {tot_server.get('_id')}")
-                logger.info(f"Name: {tot_server.get('name')}")
-                logger.info(f"Hostname: {tot_server.get('hostname')}")
-                logger.info(f"Original ID: {tot_server.get('original_server_id', 'Not set')}")
-            else:
-                logger.info("Tower of Temptation server not found in servers collection")
+            logger.info("No Emeralds servers found in servers collection")
     
     logger.info("Server configurations listing complete")
 
