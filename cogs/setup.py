@@ -374,7 +374,15 @@ class Setup(commands.Cog):
                             logger.info(f"Starting historical parse task for server {parse_id} (from {server_id})")
                             
                             # Use a longer lookback period (30 days) for initial setup
-                            files_processed, events_processed = await csv_processor_cog.run_historical_parse(parse_id, days=30)
+                            # Pass along the guild_id parameter for proper server isolation
+                            guild_id_str = str(ctx.guild_id) if hasattr(ctx, 'guild_id') else (str(ctx.guild.id) if ctx.guild else None)
+                            logger.info(f"Using guild_id {guild_id_str} for historical parse isolation")
+                            
+                            files_processed, events_processed = await csv_processor_cog.run_historical_parse(
+                                parse_id, 
+                                days=30,
+                                guild_id=guild_id_str
+                            )
                             
                             # Log the results
                             logger.info(f"Historical parse complete for server {server_id}: processed {files_processed} files with {events_processed} events")

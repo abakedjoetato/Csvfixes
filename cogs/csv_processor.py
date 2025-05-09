@@ -1019,33 +1019,75 @@ class CSVProcessorCog(commands.Cog):
             # Ensure we always return a value
             return files_processed, events_processed
 
-    async def run_historical_parse(self, server_id: str, days: int = 30) -> Tuple[int, int]:
+    async def run_historical_parse(self, server_id: str, days: int = 30, guild_id: Optional[str] = None) -> Tuple[int, int]:
         """Run a historical parse for a server, checking further back in time
 
         This function is meant to be called when setting up a new server to process
         older historical data going back further than the normal processing window.
 
         Args:
-            server_id: Server ID to process
+            server_id: Server ID to process (can be UUID or numeric ID)
             days: Number of days to look back (default: 30)
+            guild_id: Optional Discord guild ID for server isolation
 
         Returns:
             Tuple[int, int]: Number of files processed and events processed
         """
-        # Import safe standardization function
-        from utils.server_utils import safe_standardize_server_id
-        # Import server identity resolver for consistent ID handling
-        from utils.server_identity import identify_server, KNOWN_SERVERS
-
-        # Standardize server ID - always returns a string, never None
-        raw_server_id = server_id if server_id is not None else ""
-        server_id = safe_standardize_server_id(raw_server_id)
+        # Record the starting ID for logging
+        raw_input_id = server_id if server_id is not None else ""
         
-        # CRITICAL FIX: Check if this is a numeric ID (like "7020") being used directly
-        # If so, we need to find the corresponding UUID in our database
+        # Import identity resolver functions
+        from utils.server_utils import safe_standardize_server_id
+        from utils.server_identity import resolve_server_id, identify_server, KNOWN_SERVERS
+        
+        logger.info(f"Starting historical parse for server {raw_input_id}, looking back {days} days")
+        
+        # STEP 1: Try to resolve the server ID comprehensively using our new function
+        server_resolution = await resolve_server_id(self.bot.db, server_id, guild_id)
+        if server_resolution:
+            resolved_server_id = server_resolution.get("server_id")
+            original_server_id = server_resolution.get("original_server_id")
+            server_config = server_resolution.get("config")
+            collection = server_resolution.get("collection")
+            
+            logger.info(f"Enhanced server resolution found server: {server_id} → {resolved_server_id} "
+                      f"(original_id: {original_server_id}, found in {collection})")
+                      
+            # We have a direct server configuration from resolution
+            if server_config:
+                # Configure processing start time based on requested days
+                start_date = datetime.now() - timedelta(days=days)
+                logger.info(f"Historical parse will check files from {start_date.strftime('%Y-%m-%d')} until now")
+                
+                # Set the last processed time for this server
+                self.last_processed[resolved_server_id] = start_date
+                
+                # Process CSV files with the directly resolved configuration
+                async with self.processing_lock:
+                    self.is_processing = True
+                    try:
+                        # Use the resolved configuration directly
+                        files_processed, events_processed = await self._process_server_csv_files(
+                            resolved_server_id, server_config, start_date=start_date
+                        )
+                        logger.info(f"Direct resolution historical parse complete for server {resolved_server_id}: "
+                                   f"processed {files_processed} files with {events_processed} events")
+                        return files_processed, events_processed
+                    except Exception as e:
+                        logger.error(f"Error in direct resolution historical parse for server {resolved_server_id}: {e}")
+                        return 0, 0
+                    finally:
+                        self.is_processing = False
+        
+        # STEP 2: Fall back to traditional method if direct resolution failed
+        logger.info(f"Direct server resolution failed or returned no config, falling back to traditional lookup")
+        
+        # Standardize server ID and check for numeric ID
+        server_id = safe_standardize_server_id(raw_input_id)
         original_numeric_id = None
+        
+        # Check if this is a numeric ID (like "7020") being used directly
         if server_id and server_id.isdigit():
-            # This might be an original_server_id (numeric ID) passed directly
             original_numeric_id = server_id
             logger.info(f"Received numeric ID {original_numeric_id} for historical parse")
             
@@ -1058,56 +1100,52 @@ class CSVProcessorCog(commands.Cog):
                     break
             
             if found_uuid:
-                # Store the original numeric ID for path construction later
                 server_id = found_uuid
-                # Make sure we add the original_server_id to the config later
             else:
                 logger.warning(f"Could not find UUID for numeric ID {original_numeric_id} in KNOWN_SERVERS")
         
-        logger.info(f"Starting historical parse for server {raw_server_id} (standardized to {server_id}), looking back {days} days")
-
-        # Get server config
+        # Get all server configurations
         server_configs = await self._get_server_configs()
-
-        # Log all available server configs for debugging
-        logger.info(f"Available server configs: {list(server_configs.keys())}")
-
+        logger.info(f"Traditional lookup found server configs: {list(server_configs.keys())}")
+        
+        # Try to find the server in our configurations
         if server_id not in server_configs:
-            # Try numeric comparison as fallback if we have an original numeric ID
+            # Try by original_server_id if we have one
             if original_numeric_id:
-                # Look for any server with this original_server_id
                 for config_id, config in server_configs.items():
                     if str(config.get("original_server_id")) == original_numeric_id:
                         server_id = config_id
                         logger.info(f"Found server by original_server_id {original_numeric_id}: {server_id}")
                         break
             
-            # If server_id is numeric, try matching as before
+            # Try by numeric matching if needed
             if server_id not in server_configs and server_id and str(server_id).isdigit():
                 numeric_matches = [sid for sid in server_configs.keys() if str(sid).isdigit() and int(sid) == int(server_id)]
                 if numeric_matches:
                     server_id = numeric_matches[0]
                     logger.info(f"Found server using numeric matching: {server_id}")
-
-            # If still not found
+            
+            # If still not found, give up
             if server_id not in server_configs:
-                logger.error(f"Server {server_id} not found in configs during historical parse")
+                logger.error(f"Server {raw_input_id} not found in configs during historical parse")
                 return 0, 0
-
-        # Set a much earlier last_processed time to capture more history
-        self.last_processed[server_id] = datetime.now() - timedelta(days=days)
-
-        # Process CSV files with the historical window
+        
+        # Configure the processing window
+        start_date = datetime.now() - timedelta(days=days)
+        self.last_processed[server_id] = start_date
+        
+        # Process CSV files with the traditional method
         async with self.processing_lock:
             self.is_processing = True
             try:
                 files_processed, events_processed = await self._process_server_csv_files(
-                    server_id, server_configs[server_id]
+                    server_id, server_configs[server_id], start_date=start_date
                 )
-                logger.info(f"Historical parse complete for server {server_id}: processed {files_processed} files with {events_processed} events")
+                logger.info(f"Traditional historical parse complete for server {server_id}: "
+                           f"processed {files_processed} files with {events_processed} events")
                 return files_processed, events_processed
             except Exception as e:
-                logger.error(f"Error in historical parse for server {server_id}: {e}")
+                logger.error(f"Error in traditional historical parse for server {server_id}: {e}")
                 return 0, 0
             finally:
                 self.is_processing = False

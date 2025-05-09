@@ -436,7 +436,11 @@ async def run_background_tasks_with_restart(bot, task_func, interval, name, max_
             
             if failures >= max_failures:
                 logger.critical(f"Background task {name} failed {failures} times, giving up")
-                bot._background_tasks[name] = None  # Clear the task reference
+                # Clear the task reference using the property instead of the attribute
+                # First check if the task exists
+                if name in bot.background_tasks:
+                    del bot.background_tasks[name]
+                    logger.info(f"Removed task {name} from background tasks after max failures")
                 return
                 
         # Wait before restarting
@@ -475,31 +479,40 @@ async def run_bot():
         async def monitor_background_tasks():
             while True:
                 try:
-                    # Check all background tasks
-                    for task_name, task in list(bot._background_tasks.items()):
+                    # Check all background tasks - using the property instead of the private attribute
+                    for task_name, task in list(bot.background_tasks.items()):
                         if task and task.done():
-                            exception = task.exception()
-                            if exception:
-                                logger.error(f"Background task {task_name} raised an exception: {exception}", 
-                                            exc_info=exception)
-                                # Restart the task if it's critical
-                                logger.info(f"Attempting to restart background task: {task_name}")
-                                # Re-create the task based on its name
-                                if task_name == "sftp_maintenance":
-                                    new_task = asyncio.create_task(
-                                        run_background_tasks_with_restart(bot, periodic_connection_maintenance, 120, task_name)
-                                    )
-                                    bot._background_tasks[task_name] = new_task
-                            else:
-                                # Check if this is a one-time task that's meant to complete
-                                if task_name.startswith("historical_parse"):
-                                    logger.info(f"One-time task {task_name} completed successfully")
-                                    # Remove the task from the dictionary since it's done
-                                    # This avoids LSP warning about assigning None to a Task type
-                                    if task_name in bot._background_tasks:
-                                        del bot._background_tasks[task_name]
+                            try:
+                                exception = task.exception()
+                                if exception:
+                                    logger.error(f"Background task {task_name} raised an exception: {exception}", 
+                                                exc_info=exception)
+                                    # Restart the task if it's critical
+                                    logger.info(f"Attempting to restart background task: {task_name}")
+                                    # Re-create the task based on its name
+                                    if task_name == "sftp_maintenance":
+                                        new_task = asyncio.create_task(
+                                            run_background_tasks_with_restart(bot, periodic_connection_maintenance, 120, task_name)
+                                        )
+                                        bot.background_tasks[task_name] = new_task
                                 else:
-                                    logger.warning(f"Background task {task_name} completed unexpectedly")
+                                    # Check if this is a one-time task that's meant to complete
+                                    if task_name.startswith("historical_parse"):
+                                        logger.info(f"One-time task {task_name} completed successfully")
+                                        # Remove the task from the dictionary since it's done
+                                        if task_name in bot.background_tasks:
+                                            del bot.background_tasks[task_name]
+                                            logger.info(f"Removed completed historical parse task: {task_name}")
+                                    else:
+                                        logger.warning(f"Background task {task_name} completed unexpectedly")
+                            except asyncio.CancelledError:
+                                # Task was cancelled, which is expected in some cases
+                                logger.info(f"Background task {task_name} was cancelled")
+                                # Clean up the cancelled task
+                                if task_name in bot.background_tasks:
+                                    del bot.background_tasks[task_name]
+                            except Exception as task_error:
+                                logger.error(f"Error checking task {task_name} status: {task_error}")
                 except Exception as e:
                     logger.error(f"Error in background task monitor: {e}")
                 

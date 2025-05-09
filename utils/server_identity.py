@@ -8,7 +8,7 @@ proper guild isolation for server identifiers.
 import re
 import os
 import logging
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, List, Union
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,122 @@ def identify_server(server_id: str, hostname: Optional[str] = None,
     
     # If no numeric part, return the original ID (which will be used as-is)
     return str(server_id), False
+
+async def resolve_server_id(db, server_id: str, guild_id: Optional[str] = None) -> Dict[str, Any]:
+    """Comprehensively resolve a server ID to find the server configuration.
+    
+    This function searches all collections using various ID forms (UUID, numeric ID, original_server_id)
+    to ensure consistent server identity resolution across the application.
+    
+    Args:
+        db: Database connection
+        server_id: The server ID (UUID or numeric ID) to resolve
+        guild_id: Optional Discord guild ID for isolation
+        
+    Returns:
+        Dict containing server configuration or empty dict if not found:
+        - "server_id": The standardized server ID (UUID)
+        - "original_server_id": The original server ID (numeric)
+        - "config": The complete server configuration
+        - "collection": The collection where the server was found
+    """
+    if not db or not server_id:
+        logger.warning(f"Cannot resolve server ID: {'db is None' if not db else f'invalid server_id: {server_id}'}")
+        return {}
+        
+    # Ensure we're working with strings
+    server_id = str(server_id) if server_id else ""
+    guild_id = str(guild_id) if guild_id else ""
+    
+    logger.info(f"Resolving server ID: {server_id} (guild: {guild_id or 'None'})")
+    
+    # First, handle the case where server_id is a numeric ID that might be an original_server_id
+    original_id_match = None
+    if server_id.isdigit():
+        logger.info(f"Server ID {server_id} is numeric, checking if it matches any original_server_id")
+        # Look for servers with this as original_server_id
+        try:
+            # Search in game_servers collection
+            server = await db.game_servers.find_one({"original_server_id": server_id})
+            if server:
+                logger.info(f"Found server with original_server_id={server_id} in game_servers: {server.get('server_id')}")
+                return {
+                    "server_id": server.get("server_id"),
+                    "original_server_id": server_id,
+                    "config": server,
+                    "collection": "game_servers"
+                }
+                
+            # Also search in servers collection
+            server = await db.servers.find_one({"original_server_id": server_id})
+            if server:
+                logger.info(f"Found server with original_server_id={server_id} in servers: {server.get('server_id')}")
+                return {
+                    "server_id": server.get("server_id"),
+                    "original_server_id": server_id,
+                    "config": server,
+                    "collection": "servers"
+                }
+                
+            # If guild_id provided, also search in that guild's servers
+            if guild_id:
+                guild = await db.guilds.find_one({"guild_id": guild_id})
+                if guild and "servers" in guild:
+                    for guild_server in guild.get("servers", []):
+                        if str(guild_server.get("original_server_id")) == server_id:
+                            logger.info(f"Found server with original_server_id={server_id} in guild {guild_id}")
+                            return {
+                                "server_id": guild_server.get("server_id"),
+                                "original_server_id": server_id,
+                                "config": guild_server,
+                                "collection": "guilds.servers"
+                            }
+        except Exception as e:
+            logger.error(f"Error searching for server by original_server_id={server_id}: {e}")
+    
+    # Next, try direct lookup by server_id
+    try:
+        # Try game_servers first
+        server = await db.game_servers.find_one({"server_id": server_id})
+        if server:
+            logger.info(f"Found server with server_id={server_id} in game_servers")
+            return {
+                "server_id": server_id,
+                "original_server_id": server.get("original_server_id"),
+                "config": server,
+                "collection": "game_servers"
+            }
+            
+        # Then try servers collection
+        server = await db.servers.find_one({"server_id": server_id})
+        if server:
+            logger.info(f"Found server with server_id={server_id} in servers")
+            return {
+                "server_id": server_id,
+                "original_server_id": server.get("original_server_id"),
+                "config": server,
+                "collection": "servers"
+            }
+            
+        # If guild_id provided, also check that guild's servers
+        if guild_id:
+            guild = await db.guilds.find_one({"guild_id": guild_id})
+            if guild and "servers" in guild:
+                for guild_server in guild.get("servers", []):
+                    if guild_server.get("server_id") == server_id:
+                        logger.info(f"Found server with server_id={server_id} in guild {guild_id}")
+                        return {
+                            "server_id": server_id,
+                            "original_server_id": guild_server.get("original_server_id"),
+                            "config": guild_server,
+                            "collection": "guilds.servers"
+                        }
+    except Exception as e:
+        logger.error(f"Error searching for server by server_id={server_id}: {e}")
+        
+    # Server not found after checking all sources
+    logger.warning(f"Server with ID {server_id} not found in any collection")
+    return {}
 
 def get_path_components(server_id: str, hostname: str, 
                        original_server_id: Optional[str] = None,
