@@ -929,10 +929,30 @@ class CSVProcessorCog(commands.Cog):
                         csv_files.sort()
 
                         # Filter for files newer than last processed
-                        new_files = [f for f in csv_files if f > last_time_str]
+                        # Extract just the date portion from filenames for comparison with last_time_str
+                        new_files = []
+                        for f in csv_files:
+                            # Get just the filename without the path
+                            filename = os.path.basename(f)
+                            # Extract the date portion (if it exists)
+                            date_match = re.search(r'(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})', filename)
+                            if date_match:
+                                file_date_str = date_match.group(1)
+                                # Compare the extracted date with last_time_str
+                                if file_date_str > last_time_str:
+                                    new_files.append(f)
+                            else:
+                                # If we can't parse the date from the filename, include it anyway to be safe
+                                logger.warning(f"Could not extract date from filename: {filename}, including by default")
+                                new_files.append(f)
 
                         # Log what we found
                         logger.info(f"Found {len(new_files)} new CSV files out of {len(csv_files)} total in {deathlogs_path}")
+                        if len(csv_files) > 0 and len(new_files) == 0:
+                            # Show a sample of the CSV files and the last_time_str for debugging
+                            sample = csv_files[:3] if len(csv_files) > 3 else csv_files
+                            logger.info(f"All {len(csv_files)} files were filtered out as older than {last_time_str}")
+                            logger.info(f"Sample filenames: {[os.path.basename(f) for f in sample]}")
 
                         # Process each file
                         files_processed = 0
