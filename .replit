@@ -21,7 +21,7 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python main.py"
+args = "bash discord_bot_workflow.sh"
 
 [deployment]
-run = ["sh", "-c", "python main.py"]
+run = ["sh", "-c", "bash discord_bot_workflow.sh"]

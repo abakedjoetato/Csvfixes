@@ -331,6 +331,111 @@ class Player(BaseModel):
         # Return top n rivalries
         return rivalries[:limit]
     
+    @classmethod
+    async def update_all_nemesis_and_prey(cls, db, server_id: str, min_kills: int = 3) -> int:
+        """Update nemesis and prey relationships for all players on a server in batch
+        
+        This is a more efficient version that processes all players in a server at once.
+        Useful after batch-importing many events to reduce database operations.
+        
+        Args:
+            db: Database connection
+            server_id: Server ID to process
+            min_kills: Minimum kills threshold (default 3)
+            
+        Returns:
+            Number of players updated
+        """
+        from models.rivalry import Rivalry
+        
+        logger.info(f"Batch updating nemesis/prey relationships for server {server_id}")
+        
+        # Step 1: Get all rivalries for this server with kill counts above threshold
+        rivalry_data = await Rivalry.get_all_server_rivalries(db, server_id, min_kills)
+        
+        # Early exit if no rivalries found
+        if not rivalry_data:
+            logger.info(f"No rivalries found for server {server_id} with min kills {min_kills}")
+            return 0
+            
+        # Step 2: Organize rivalries by player
+        player_rivalries = {}
+        
+        for rivalry in rivalry_data:
+            player_id = rivalry.get("player_id")
+            if not player_id:
+                continue
+                
+            if player_id not in player_rivalries:
+                player_rivalries[player_id] = []
+            
+            player_rivalries[player_id].append(rivalry)
+            
+        # Step 3: For each player, find nemesis and prey
+        updates = []
+        
+        for player_id, rivalries in player_rivalries.items():
+            # Find nemesis (opponent with most kills against this player)
+            # and prey (opponent this player has killed the most)
+            nemesis = None
+            prey = None
+            
+            for rivalry in rivalries:
+                # Check for potential nemesis (most deaths to this opponent)
+                if nemesis is None or rivalry.get("deaths", 0) > nemesis.get("deaths", 0):
+                    # Only consider as nemesis if they've killed this player at least min_kills times
+                    if rivalry.get("deaths", 0) >= min_kills:
+                        nemesis = {
+                            "id": rivalry.get("rival_id"),
+                            "name": rivalry.get("rival_name"),
+                            "deaths": rivalry.get("deaths", 0)
+                        }
+                
+                # Check for potential prey (most kills against this opponent)
+                if prey is None or rivalry.get("kills", 0) > prey.get("kills", 0):
+                    # Only consider as prey if this player has killed them at least min_kills times
+                    if rivalry.get("kills", 0) >= min_kills:
+                        prey = {
+                            "id": rivalry.get("rival_id"),
+                            "name": rivalry.get("rival_name"),
+                            "kills": rivalry.get("kills", 0)
+                        }
+            
+            # Create update document if we found nemesis or prey
+            update_dict = {"updated_at": datetime.utcnow()}
+            
+            if nemesis:
+                update_dict["nemesis_id"] = nemesis["id"]
+                update_dict["nemesis_name"] = nemesis["name"]
+                
+            if prey:
+                update_dict["prey_id"] = prey["id"]
+                update_dict["prey_name"] = prey["name"]
+                
+            if len(update_dict) > 1:  # More than just updated_at
+                updates.append({
+                    "filter": {"player_id": player_id, "server_id": server_id},
+                    "update": {"$set": update_dict}
+                })
+        
+        # Step 4: Execute bulk updates if we have any
+        if updates:
+            try:
+                # Execute bulk write
+                bulk_ops = [
+                    {"updateOne": update}
+                    for update in updates
+                ]
+                
+                result = await db.players.bulk_write(bulk_ops, ordered=False)
+                logger.info(f"Bulk updated {result.modified_count} player nemesis/prey relationships")
+                return result.modified_count
+            except Exception as e:
+                logger.error(f"Error in bulk nemesis/prey update: {e}")
+                return 0
+        
+        return 0
+        
     async def update_nemesis_and_prey(self, db, min_kills: int = 3) -> bool:
         """Update player's nemesis and prey based on rivalries
         

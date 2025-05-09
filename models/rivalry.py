@@ -289,6 +289,62 @@ class Rivalry:
         return [cls(rivalry_data) for rivalry_data in rivalries_data]
     
     @classmethod
+    async def get_all_server_rivalries(cls, db, server_id: str, min_kills: int = 1) -> List[Dict[str, Any]]:
+        """Get all rivalries for a server with minimum kill threshold
+        
+        This method is specifically designed for batch processing of nemesis/prey relationships.
+        It returns a flattened list of rivalries from the player perspective.
+        
+        Args:
+            db: Database connection
+            server_id: Server ID
+            min_kills: Minimum kills threshold (default: 1)
+            
+        Returns:
+            List of rivalry dictionaries from player perspective
+        """
+        # Access the rivalries collection
+        rivalries_collection = db.collections["rivalries"] if hasattr(db, "collections") else db.rivalries
+        
+        cursor = rivalries_collection.find(
+            {
+                "server_id": server_id,
+                "$or": [
+                    {"player1_kills": {"$gte": min_kills}},
+                    {"player2_kills": {"$gte": min_kills}}
+                ]
+            }
+        )
+        
+        # We'll transform rivalries into a player-centric view
+        player_rivalries = []
+        
+        async for rivalry in cursor:
+            # Create a view from player1's perspective
+            player_rivalries.append({
+                "player_id": rivalry.get("player1_id"),
+                "player_name": rivalry.get("player1_name"),
+                "rival_id": rivalry.get("player2_id"),
+                "rival_name": rivalry.get("player2_name"),
+                "kills": rivalry.get("player1_kills", 0),
+                "deaths": rivalry.get("player2_kills", 0),
+                "server_id": rivalry.get("server_id")
+            })
+            
+            # Create a view from player2's perspective
+            player_rivalries.append({
+                "player_id": rivalry.get("player2_id"),
+                "player_name": rivalry.get("player2_name"),
+                "rival_id": rivalry.get("player1_id"),
+                "rival_name": rivalry.get("player1_name"),
+                "kills": rivalry.get("player2_kills", 0),
+                "deaths": rivalry.get("player1_kills", 0),
+                "server_id": rivalry.get("server_id")
+            })
+            
+        return player_rivalries
+    
+    @classmethod
     async def get_recent_rivalries(cls, server_id: str, limit: int = 10, days: int = 7) -> List['Rivalry']:
         """Get recently active rivalries
         
