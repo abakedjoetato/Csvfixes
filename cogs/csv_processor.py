@@ -1085,13 +1085,17 @@ class CSVProcessorCog(commands.Cog):
                                     # regardless of last_processed time to ensure we don't miss any data
                                     seven_days_ago = datetime.now() - timedelta(days=7)
                                     
-                                    # Compare as datetime objects with special case for recent files
-                                    if file_date > last_time_date or file_date >= seven_days_ago:
-                                        logger.info(f"FIXED: Including file {filename} with date {file_date} (last_processed={last_time_date}, 7_days_ago={seven_days_ago})")
-                                        new_files.append(f)
-                                    else:
-                                        logger.info(f"File date {file_date} is older than last processed {last_time_date} and older than 7 days")
-                                        skipped_files.append(f)
+                                    # CRITICAL FIX: Include all files, regardless of date
+                                    # This ensures that all files are processed during historical parsing
+                                    logger.info(f"CRITICAL FIX: Including file {filename} regardless of date comparison")
+                                    new_files.append(f)
+                                    # Comment out old exclusion logic:
+                                    # if file_date > last_time_date or file_date >= seven_days_ago:
+                                    #     logger.info(f"FIXED: Including file {filename} with date {file_date} (last_processed={last_time_date}, 7_days_ago={seven_days_ago})")
+                                    #     new_files.append(f)
+                                    # else:
+                                    #     logger.info(f"File date {file_date} is older than last processed {last_time_date} and older than 7 days")
+                                    #     skipped_files.append(f)
                                 except ValueError as e:
                                     # Try alternative date formats - primary format is yyyy.mm.dd-hh.mm.ss as confirmed by user
                                     parsed = False
@@ -1106,13 +1110,17 @@ class CSVProcessorCog(commands.Cog):
                                             # Apply the same logic as above - include files from last 7 days
                                             seven_days_ago = datetime.now() - timedelta(days=7)
                                             
-                                            # Compare as datetime objects with special case for recent files
-                                            if file_date > last_time_date or file_date >= seven_days_ago:
-                                                logger.info(f"FIXED: Including file {filename} with date {file_date} using alternate format")
-                                                new_files.append(f)
-                                            else:
-                                                logger.info(f"File date {file_date} is older than last processed {last_time_date} and older than 7 days")
-                                                skipped_files.append(f)
+                                            # CRITICAL FIX: Immediately include all files, regardless of date
+                                            # This ensures that all files are processed during historical parsing
+                                            logger.info(f"CRITICAL FIX: Including file {filename} with date {file_date} regardless of date comparison")
+                                            new_files.append(f)
+                                            # Comment out old exclusion logic:
+                                            # if file_date > last_time_date or file_date >= seven_days_ago:
+                                            #     logger.info(f"FIXED: Including file {filename} with date {file_date} using alternate format")
+                                            #     new_files.append(f)
+                                            # else:
+                                            #     logger.info(f"File date {file_date} is older than last processed {last_time_date} and older than 7 days")
+                                            #     skipped_files.append(f)
                                             break
                                         except ValueError:
                                             continue
