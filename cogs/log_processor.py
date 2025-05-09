@@ -397,19 +397,31 @@ class LogProcessorCog(commands.Cog):
                         config["original_server_id"] = path_server_id
                 # Next check if we have original_server_id in config
                 elif original_id := config.get("original_server_id"):
+                    # CRITICAL FIX: Always use a numeric ID for path construction when possible
+                    # If original_id is numeric (like "7020"), use it directly
+                    if str(original_id).isdigit():
+                        path_server_id = str(original_id)
+                        logger.info(f"Using numeric original_server_id from config: {original_id}")
                     # If the original_id is a UUID, try to find it in KNOWN_SERVERS
-                    if not original_id.isdigit() and len(original_id) > 10:
+                    elif len(str(original_id)) > 10 and "-" in str(original_id):
                         # Looks like a UUID, check if it's a key in KNOWN_SERVERS
                         if original_id in KNOWN_SERVERS:
                             path_server_id = KNOWN_SERVERS[original_id]
                             logger.info(f"Mapped UUID original_server_id to numeric ID {path_server_id}")
                         else:
-                            path_server_id = original_id
-                            logger.info(f"Using original_server_id from config for path construction: {original_id}")
+                            # Try to extract numeric portion from the UUID as fallback
+                            numeric_parts = re.findall(r'\d+', str(original_id))
+                            if numeric_parts and len(numeric_parts[0]) >= 4:
+                                path_server_id = numeric_parts[0]
+                                logger.info(f"Extracted numeric portion ({path_server_id}) from UUID original_server_id")
+                            else:
+                                # Last resort - use the original ID but with warning
+                                path_server_id = str(original_id)
+                                logger.warning(f"Using UUID original_server_id as fallback (not recommended): {original_id}")
                     else:
-                        # Looks like a numeric ID, use it directly
-                        path_server_id = original_id
-                        logger.info(f"Using original_server_id from config for path construction: {original_id}")
+                        # Not UUID, not numeric, but still use it
+                        path_server_id = str(original_id)
+                        logger.info(f"Using original_server_id from config (non-numeric, non-UUID): {original_id}")
                 else:
                     # Get consistent numeric ID for path construction using server_identity module
                     numeric_id, is_known = identify_server(

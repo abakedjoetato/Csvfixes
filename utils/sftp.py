@@ -415,39 +415,44 @@ class SFTPManager:
         self.max_retries = max_retries
         self.server_id = server_id
         
-        # Store numeric server ID for path construction - critical for correct folder paths
+        # Store numeric server ID for path construction - CRITICAL for correct folder paths
+        # This is a high-priority fix to solve the UUID vs numeric ID path issue
         
         # ALWAYS get a numeric ID for path construction - critical fix for UUID path issues
         try:
             from utils.server_identity import identify_server, KNOWN_SERVERS
             
-            # Default to original_server_id if provided, will be overridden by better options
+            # Start with reasonable default: provided original_server_id or server_id (will be improved)
             self.original_server_id = original_server_id or server_id
             
-            # 1. Priority 1: Check KNOWN_SERVERS mapping for server_id (highest authority)
-            if server_id in KNOWN_SERVERS:
+            # Priority 1: Check KNOWN_SERVERS mapping for server_id (highest authority)
+            # This is the authoritative source for numeric IDs, and should be used whenever possible
+            if server_id and server_id in KNOWN_SERVERS:
                 numeric_id = KNOWN_SERVERS[server_id]
                 logger.info(f"SFTPClient using known numeric ID '{numeric_id}' for path construction instead of '{server_id}'")
                 self.original_server_id = numeric_id
                 
-            # 2. Priority 2: If original_server_id is provided and is numeric, use it directly
+            # Priority 2: If original_server_id is provided and is numeric, use it directly
+            # This is likely a numeric ID explicitly provided by the caller
             elif original_server_id and str(original_server_id).isdigit():
                 logger.info(f"SFTPClient using provided numeric original_server_id: {original_server_id}")
                 # Already set in default above
                 
-            # 3. Priority 3: If original_server_id is provided but is a UUID, try to map it
+            # Priority 3: If original_server_id is provided but is a UUID, try to map it
+            # This handles the case where we're given a UUID as original_server_id
             elif original_server_id and len(str(original_server_id)) > 10:
-                # Check if UUID original_server_id is in KNOWN_SERVERS
+                # First check if this UUID is in KNOWN_SERVERS
                 if original_server_id in KNOWN_SERVERS:
                     numeric_id = KNOWN_SERVERS[original_server_id]
                     logger.info(f"SFTPClient mapped UUID original_server_id '{original_server_id}' to numeric ID '{numeric_id}'")
                     self.original_server_id = numeric_id
                 else:
                     # Use server_identity module to resolve the UUID
+                    # This will check all possible ways to determine the numeric server ID
                     numeric_id, is_known = identify_server(
-                        server_id=original_server_id,
-                        hostname=hostname,
-                        server_name=server_id  # Use server_id as fallback server_name
+                        server_id=original_server_id or "",
+                        hostname=hostname or "",
+                        server_name=server_id or ""  # Use server_id as fallback server_name
                     )
                     
                     if numeric_id:
@@ -852,21 +857,34 @@ class SFTPManager:
             try:
                 # Clean hostname for directory structure (remove port if present)
                 clean_hostname = self.hostname.split(':')[0] if self.hostname else "server"
-
-                # Try to extract numeric ID first
-                numeric_id = None
-                if '_' in clean_hostname:
+                
+                # HIGH PRIORITY FIX: Ensure we always use the numeric server ID (original_server_id) for path construction
+                # This is critical for consistent path generation across server UUIDs
+                
+                # PRIORITY 1: Always use original_server_id if available and numeric
+                path_server_id = None
+                if hasattr(self, 'original_server_id') and self.original_server_id:
+                    if str(self.original_server_id).isdigit():
+                        path_server_id = self.original_server_id
+                        logger.info(f"Using numeric original_server_id '{path_server_id}' for path construction")
+                    else:
+                        # Not numeric, but still prefer original_server_id over server_id
+                        path_server_id = self.original_server_id
+                        logger.debug(f"Using non-numeric original_server_id '{path_server_id}' for path construction")
+                
+                # PRIORITY 2: Try to extract numeric ID from hostname if path_server_id isn't set yet
+                if not path_server_id and '_' in clean_hostname:
                     potential_id = clean_hostname.split('_')[-1]
                     if potential_id.isdigit():
-                        numeric_id = potential_id
-                        logger.info(f"Using numeric ID from hostname: {numeric_id}")
-
-                # Fallback chain: numeric_id -> original_server_id -> server_id
-                path_server_id = numeric_id
+                        path_server_id = potential_id
+                        logger.info(f"Using numeric ID from hostname: {path_server_id}")
+                
+                # PRIORITY 3: Last resort - use server_id but log a warning since this is likely a UUID
                 if not path_server_id:
-                    path_server_id = self.original_server_id if hasattr(self, 'original_server_id') and self.original_server_id else self.server_id
-                    logger.debug(f"Using fallback server ID '{path_server_id}' for path construction")
-
+                    path_server_id = self.server_id
+                    logger.warning(f"No numeric server ID found for path construction, using UUID as fallback: {path_server_id}")
+                
+                # Always convert to string for path construction
                 server_id_str = str(path_server_id)
 
                 # Define path structure constants
