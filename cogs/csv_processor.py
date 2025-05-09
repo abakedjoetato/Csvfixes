@@ -386,12 +386,14 @@ class CSVProcessorCog(commands.Cog):
     # This method is no longer used, replaced by the more comprehensive _get_server_configs method
     # The functionality has been migrated to _get_server_configs and _process_server_config
 
-    async def _process_server_csv_files(self, server_id: str, config: Dict[str, Any]) -> Tuple[int, int]:
+    async def _process_server_csv_files(self, server_id: str, config: Dict[str, Any], 
+                               start_date: Optional[datetime] = None) -> Tuple[int, int]:
         """Process CSV files for a specific server
 
         Args:
             server_id: Server ID
             config: Server configuration
+            start_date: Optional start date for processing (default: last 24 hours)
 
         Returns:
             Tuple[int, int]: Number of files processed and total death events processed
@@ -402,8 +404,13 @@ class CSVProcessorCog(commands.Cog):
         username = config["username"]  # Already mapped in _get_server_configs
         password = config["password"]  # Already mapped in _get_server_configs
 
-        # Get last processed time or default to 24 hours ago
-        last_time = self.last_processed.get(server_id, datetime.now() - timedelta(days=1))
+        # Use provided start_date, or get last processed time, or default to 24 hours ago
+        if start_date:
+            last_time = start_date
+            logger.info(f"Using provided start_date for CSV processing: {last_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            last_time = self.last_processed.get(server_id, datetime.now() - timedelta(days=1))
+            logger.debug(f"Using last processed time: {last_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Format for SFTP directory listing comparison
         last_time_str = last_time.strftime("%Y.%m.%d-%H.%M.%S")
@@ -1019,6 +1026,55 @@ class CSVProcessorCog(commands.Cog):
             # Ensure we always return a value
             return files_processed, events_processed
 
+    async def run_historical_parse_with_config(self, server_id: str, server_config: Dict[str, Any], 
+                                  days: int = 30, guild_id: Optional[str] = None) -> Tuple[int, int]:
+        """Run a historical parse for a server using direct configuration.
+        
+        This enhanced method accepts a complete server configuration object to bypass resolution issues,
+        ensuring we have all the necessary details even for newly added servers.
+
+        Args:
+            server_id: Server ID to process
+            server_config: Complete server configuration with SFTP details
+            days: Number of days to look back (default: 30)
+            guild_id: Optional Discord guild ID for server isolation
+
+        Returns:
+            Tuple[int, int]: Number of files processed and events processed
+        """
+        logger.info(f"Starting historical parse with direct config for server {server_id}, looking back {days} days")
+        
+        # Configure processing start time based on requested days
+        start_date = datetime.now() - timedelta(days=days)
+        logger.info(f"Historical parse will check files from {start_date.strftime('%Y-%m-%d')} until now")
+        
+        # Set the last processed time for this server
+        self.last_processed[server_id] = start_date
+        
+        # Ensure original_server_id is present in config
+        original_server_id = server_config.get("original_server_id")
+        if original_server_id:
+            logger.info(f"Using original_server_id {original_server_id} from provided config")
+        else:
+            logger.warning(f"No original_server_id in provided config, paths may use UUID format")
+        
+        # Process the server directly with provided configuration
+        async with self.processing_lock:
+            self.is_processing = True
+            try:
+                # Pass the full configuration and start date directly to _process_server_csv_files
+                files_processed, events_processed = await self._process_server_csv_files(
+                    server_id, server_config, start_date=start_date
+                )
+                logger.info(f"Direct config historical parse complete for server {server_id}: "
+                          f"processed {files_processed} files with {events_processed} events")
+                return files_processed, events_processed
+            except Exception as e:
+                logger.error(f"Error in direct config historical parse for server {server_id}: {e}")
+                return 0, 0
+            finally:
+                self.is_processing = False
+    
     async def run_historical_parse(self, server_id: str, days: int = 30, guild_id: Optional[str] = None) -> Tuple[int, int]:
         """Run a historical parse for a server, checking further back in time
 

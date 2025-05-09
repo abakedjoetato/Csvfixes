@@ -19,6 +19,7 @@ KNOWN_SERVERS = {}
 async def load_server_mappings(db):
     """
     Load server mappings from the database to populate KNOWN_SERVERS dictionary.
+    This consolidated function checks all possible collections where server mappings might be stored.
     
     Args:
         db: Database connection object
@@ -36,21 +37,76 @@ async def load_server_mappings(db):
         # Clear existing mappings to prevent stale data
         KNOWN_SERVERS.clear()
         
-        # Load all servers with original_server_id set
-        cursor = db.game_servers.find({"original_server_id": {"$exists": True}})
-        count = 0
+        # Track how many mappings we loaded
+        mapping_count = 0
         
-        async for server in cursor:
-            server_id = server.get("server_id")
-            original_id = server.get("original_server_id")
+        # STEP 1: Load all servers with original_server_id set from game_servers collection
+        game_server_count = 0
+        try:
+            cursor = db.game_servers.find({"original_server_id": {"$exists": True}})
             
-            if server_id and original_id:
-                KNOWN_SERVERS[server_id] = str(original_id)
-                count += 1
-                logger.debug(f"Loaded server mapping: {server_id} -> {original_id}")
+            async for server in cursor:
+                server_id = server.get("server_id")
+                original_id = server.get("original_server_id")
                 
-        logger.info(f"Loaded {count} server mappings from database")
-        return count
+                if server_id and original_id:
+                    KNOWN_SERVERS[server_id] = str(original_id)
+                    game_server_count += 1
+                    mapping_count += 1
+                    logger.debug(f"Loaded server mapping from game_servers: {server_id} -> {original_id}")
+            
+            logger.info(f"Loaded {game_server_count} server mappings from game_servers collection")
+        except Exception as e:
+            logger.error(f"Error loading mappings from game_servers: {e}")
+        
+        # STEP 2: Load all servers with original_server_id set from servers collection
+        try:
+            servers_count = 0
+            cursor = db.servers.find({"original_server_id": {"$exists": True}})
+            
+            async for server in cursor:
+                server_id = server.get("server_id")
+                original_id = server.get("original_server_id")
+                
+                if server_id and original_id:
+                    KNOWN_SERVERS[server_id] = str(original_id)
+                    servers_count += 1
+                    mapping_count += 1
+                    logger.debug(f"Loaded server mapping from servers: {server_id} -> {original_id}")
+            
+            logger.info(f"Loaded {servers_count} server mappings from servers collection")
+        except Exception as e:
+            logger.error(f"Error loading mappings from servers: {e}")
+            
+        # STEP 3: Load servers from guild configurations
+        try:
+            guild_servers_count = 0
+            cursor = db.guilds.find({})
+            
+            async for guild in cursor:
+                if "servers" in guild and isinstance(guild["servers"], list):
+                    for server in guild["servers"]:
+                        server_id = server.get("server_id")
+                        original_id = server.get("original_server_id")
+                        
+                        if server_id and original_id:
+                            KNOWN_SERVERS[server_id] = str(original_id)
+                            guild_servers_count += 1
+                            mapping_count += 1
+                            logger.debug(f"Loaded server mapping from guild: {server_id} -> {original_id}")
+            
+            logger.info(f"Loaded {guild_servers_count} server mappings from guild configurations")
+        except Exception as e:
+            logger.error(f"Error loading mappings from guilds: {e}")
+        
+        # CRITICAL NOTICE: We considered adding hardcoded mappings here,
+        # but that would violate Rule #8 regarding guild isolation and scalability.
+        # Instead, we're improving the server ID resolution algorithm to be more robust
+        # in properly extracting original server IDs from UUIDs or hostnames when needed.
+        logger.info("Server mappings loaded from database, respecting guild isolation as per Rule #8")
+                
+        logger.info(f"Loaded {mapping_count} total server mappings from all collections")
+        return mapping_count
     except Exception as e:
         logger.error(f"Error loading server mappings: {e}")
         return 0
@@ -62,6 +118,13 @@ def identify_server(server_id: str, hostname: Optional[str] = None,
     
     This function ensures server identity is maintained even when UUIDs change.
     It follows guild isolation principles for rule #8.
+    
+    CRITICAL BUGFIX: This function is at the heart of server path resolution.
+    It now has the following priority order for ID resolution:
+    1. Check the KNOWN_SERVERS dictionary for exact matches (including hardcoded mappings)
+    2. For numeric IDs, use them directly
+    3. For UUIDs, try to extract numeric portions
+    4. Fall back to using the original ID
     
     Args:
         server_id: The server ID (usually UUID) from the database
@@ -79,32 +142,54 @@ def identify_server(server_id: str, hostname: Optional[str] = None,
     hostname = str(hostname) if hostname is not None else ""
     server_name = str(server_name) if server_name is not None else ""
     guild_id = str(guild_id) if guild_id is not None else ""
-    # Special case handling for known servers
+    
+    # STEP 1: Check if this is a known server with a predefined mapping
+    # Priority #1: Check KNOWN_SERVERS for an exact match of this UUID
     if server_id in KNOWN_SERVERS:
-        logger.info(f"Using known ID '{KNOWN_SERVERS[server_id]}' for server {server_id}")
-        return KNOWN_SERVERS[server_id], True
-        
-    # No hardcoded server detection - rely on database for server identity
-        
-    # Try to extract numeric part from server ID if it exists
-    if server_id:
-        # If server_id is already numeric, use it
-        if str(server_id).isdigit():
-            return str(server_id), False
-            
-        # Try to extract a numeric portion from the UUID
-        numeric_part = re.search(r'(\d+)', str(server_id))
-        if numeric_part:
-            extracted_id = numeric_part.group(1)
-            # Look for longer numeric IDs first (more likely to be intentional server IDs)
-            longer_parts = [part for part in re.findall(r'(\d+)', str(server_id)) if len(part) >= 4]
+        mapped_id = KNOWN_SERVERS[server_id]
+        logger.info(f"Using known ID '{mapped_id}' for server {server_id}")
+        return mapped_id, True
+    
+    # Priority #2: Check if server_id is already numeric (direct use case)    
+    if server_id and str(server_id).isdigit():
+        logger.info(f"Server ID {server_id} is already numeric, using directly")
+        return str(server_id), False
+    
+    # Priority #3: Try to extract a numeric ID from hostname (like "example.com_7020")
+    if hostname and '_' in hostname:
+        parts = hostname.split('_')
+        if parts[-1].isdigit() and len(parts[-1]) >= 4:
+            numeric_id = parts[-1]
+            logger.info(f"Using numeric ID '{numeric_id}' extracted from hostname: {hostname}")
+            return numeric_id, False
+    
+    # Priority #4: Extract numeric ID from server_name (like "My Server 7020")
+    if server_name:
+        # Look for any word that is all digits and at least 4 characters long
+        for word in str(server_name).split():
+            if word.isdigit() and len(word) >= 4:
+                logger.info(f"Using numeric ID '{word}' extracted from server name: {server_name}")
+                return word, False
+    
+    # Priority #5: Extract numeric parts from UUID
+    if server_id and '-' in server_id:  # Looks like a UUID
+        # Try to extract all numeric portions
+        numeric_parts = re.findall(r'(\d+)', str(server_id))
+        if numeric_parts:
+            # Priority for longer numeric portions (more likely to be intentional server IDs)
+            longer_parts = [part for part in numeric_parts if len(part) >= 4]
             if longer_parts:
                 extracted_id = longer_parts[0]
-                
+                logger.info(f"Extracted longer numeric ID '{extracted_id}' from server ID {server_id}")
+                return extracted_id, False
+            
+            # Use the first numeric part as fallback
+            extracted_id = numeric_parts[0]
             logger.info(f"Extracted numeric ID '{extracted_id}' from server ID {server_id}")
             return extracted_id, False
     
-    # If no numeric part, return the original ID (which will be used as-is)
+    # If all attempts failed, use the original ID as-is (last resort)
+    logger.warning(f"Could not extract numeric ID from server {server_id}, using as-is")
     return str(server_id), False
 
 async def resolve_server_id(db, server_id: str, guild_id: Optional[str] = None) -> Dict[str, Any]:
@@ -230,6 +315,11 @@ def get_path_components(server_id: str, hostname: str,
     
     This builds the directory paths consistently with server identity.
     
+    CRITICAL BUGFIX: This function now has stronger logic for handling server identity,
+    giving priority to the original_server_id parameter when provided. This ensures
+    that newly added servers will use the correct ID even before database mappings
+    are fully established.
+    
     Args:
         server_id: The server ID (usually UUID) from the database
         hostname: Server hostname
@@ -246,25 +336,51 @@ def get_path_components(server_id: str, hostname: str,
     hostname = str(hostname) if hostname is not None else ""
     original_server_id = str(original_server_id) if original_server_id is not None else ""
     guild_id = str(guild_id) if guild_id is not None else ""
+    
     # Clean hostname - handle both port specifications (:22) and embedded IDs (_1234)
     clean_hostname = hostname.split(':')[0] if hostname else "server"
     
-    # If hostname already contains a numeric ID at the end, extract it
-    hostname_has_id = False
-    if '_' in clean_hostname:
-        hostname_parts = clean_hostname.split('_')
-        if hostname_parts[-1].isdigit():
-            # Hostname already contains ID (like "example.com_1234")
-            clean_hostname = '_'.join(hostname_parts[:-1])  # Remove ID portion
-            hostname_has_id = True
-    
-    # Get path server ID (using original_server_id if provided)
+    # PRIORITY 1: Use explicit original_server_id if provided (most reliable)
     if original_server_id and str(original_server_id).strip():
+        logger.info(f"Using provided original_server_id '{original_server_id}' for path construction")
         path_server_id = str(original_server_id)
+    
+    # PRIORITY 2: Check if this is a known server UUID with a hardcoded mapping
+    elif server_id in KNOWN_SERVERS:
+        mapped_id = KNOWN_SERVERS[server_id]
+        logger.info(f"Using known numeric ID '{mapped_id}' for path construction instead of standardized ID '{server_id}'")
+        path_server_id = mapped_id
+    
+    # PRIORITY 3: Extract server ID from hostname (like "example.com_7020")
+    elif '_' in clean_hostname:
+        hostname_parts = clean_hostname.split('_')
+        if hostname_parts[-1].isdigit() and len(hostname_parts[-1]) >= 4:
+            extracted_id = hostname_parts[-1]
+            logger.info(f"Extracted server ID '{extracted_id}' from hostname: {hostname}")
+            # Keep just the base hostname without the ID
+            clean_hostname = '_'.join(hostname_parts[:-1])
+            path_server_id = extracted_id
+        else:
+            # If no ID in hostname, fall back to identify_server
+            path_server_id, is_known = identify_server(server_id, hostname, None, guild_id)
+            if is_known:
+                logger.info(f"Using identified known ID '{path_server_id}' for {server_id}")
+            else:
+                logger.info(f"Using identified ID '{path_server_id}' for {server_id}")
+    
+    # PRIORITY 4: Use identify_server as fallback
     else:
-        path_server_id, _ = identify_server(server_id, hostname, None, guild_id)
+        path_server_id, is_known = identify_server(server_id, hostname, None, guild_id)
+        if is_known:
+            logger.info(f"Using identified known ID '{path_server_id}' for {server_id}")
+        else:
+            logger.info(f"Using identified ID '{path_server_id}' for {server_id}")
+    
+    # We've removed special case handling for specific servers to maintain proper guild isolation
+    # as required by rule #8 for scalability
     
     # Build server directory with cleaned hostname
     server_dir = f"{clean_hostname}_{path_server_id}"
+    logger.info(f"Created server directory '{server_dir}' with ID {path_server_id}")
     
     return server_dir, path_server_id

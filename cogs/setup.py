@@ -338,51 +338,110 @@ class Setup(commands.Cog):
                     
                     async def run_historical_parse_task():
                         try:
-                            # Add a delay to ensure database writes are complete before starting the parse
+                            # Add a delay to ensure database writes are complete and server ID mappings are loaded
                             delay_seconds = 30
                             logger.info(f"Waiting {delay_seconds} seconds before starting historical parse for server {server_id} to ensure database writes are complete")
                             await asyncio.sleep(delay_seconds)
                             
-                            # CRITICAL: Use original_server_id for path construction consistency
-                            # We must use the original numeric ID (7020) for consistency across all operations
-                            # This ensures that the historical parse uses the same paths as the log processor
+                            # CRITICAL BUGFIX #1: After adding a new server, the historical parser needs to:
+                            # 1. Ensure the server mapping is loaded in the KNOWN_SERVERS dictionary
+                            # 2. Pass complete configuration to the historical parser
+                            # 3. Use original_server_id consistently for path construction
                             
-                            # Retrieve the server from the database to ensure we have the most up-to-date data
+                            # First, reload the server ID mappings to ensure our new server is in KNOWN_SERVERS
+                            from utils.server_identity import load_server_mappings
+                            mapping_count = await load_server_mappings(self.bot.db)
+                            logger.info(f"Reloaded {mapping_count} server ID mappings before historical parse")
+                            
+                            # Next, retrieve the complete server configuration to pass directly
+                            # Try multiple collections to ensure we find it
+                            server_config = None
+                            
+                            # Try the servers collection first (primary location)
                             try:
                                 server_doc = await self.bot.db.servers.find_one({"server_id": server_id})
                                 if server_doc:
-                                    # Use the server_id from the database for consistency
+                                    server_config = server_doc
                                     db_server_id = server_doc.get("server_id")
                                     db_original_id = server_doc.get("original_server_id")
-                                    
-                                    # Log the retrieved server information
-                                    logger.info(f"Retrieved server from database: id={db_server_id}, original_id={db_original_id}")
-                                    
-                                    # We want to use the original_server_id if it exists, otherwise use the server_id
-                                    parse_id = db_original_id if db_original_id else (original_server_id if original_server_id else server_id)
-                                    logger.info(f"Using ID {parse_id} for historical parse")
-                                else:
-                                    # Fall back to the original ID if we can't find the server in the database
-                                    parse_id = original_server_id if original_server_id else server_id
-                                    logger.warning(f"Could not find server {server_id} in database, falling back to {parse_id}")
+                                    logger.info(f"Found server in servers collection: id={db_server_id}, original_id={db_original_id}")
                             except Exception as db_err:
-                                # If there's an error retrieving from the database, fall back to the original ID
+                                logger.error(f"Error retrieving from servers collection: {db_err}")
+                            
+                            # If not found in servers, try game_servers
+                            if not server_config:
+                                try:
+                                    server_doc = await self.bot.db.game_servers.find_one({"server_id": server_id})
+                                    if server_doc:
+                                        server_config = server_doc
+                                        db_server_id = server_doc.get("server_id")
+                                        db_original_id = server_doc.get("original_server_id")
+                                        logger.info(f"Found server in game_servers collection: id={db_server_id}, original_id={db_original_id}")
+                                except Exception as db_err:
+                                    logger.error(f"Error retrieving from game_servers collection: {db_err}")
+                            
+                            # If still not found, try the guilds collection
+                            if not server_config:
+                                try:
+                                    guild_id_str = str(ctx.guild_id) if hasattr(ctx, 'guild_id') else (str(ctx.guild.id) if ctx.guild else None)
+                                    if guild_id_str:
+                                        guild_doc = await self.bot.db.guilds.find_one({"guild_id": guild_id_str})
+                                        if guild_doc and "servers" in guild_doc:
+                                            for guild_server in guild_doc.get("servers", []):
+                                                if guild_server.get("server_id") == server_id:
+                                                    server_config = guild_server
+                                                    logger.info(f"Found server in guilds.servers array: id={server_id}, original_id={guild_server.get('original_server_id')}")
+                                                    break
+                                except Exception as db_err:
+                                    logger.error(f"Error retrieving from guilds collection: {db_err}")
+                            
+                            # CRITICAL BUGFIX #2: Ensure original_server_id is properly set for path construction
+                            # This fixes the UUID vs numeric ID issue with newly added servers
+                            
+                            # If we found a configuration, use it for the parse
+                            # If not, fall back to just the server ID and rely on automatic resolution
+                            if server_config:
+                                # Ensure SFTP credentials are set correctly
+                                if not server_config.get("hostname") and server_config.get("sftp_host"):
+                                    server_config["hostname"] = server_config.get("sftp_host")
+                                if not server_config.get("port") and server_config.get("sftp_port"):
+                                    server_config["port"] = server_config.get("sftp_port")
+                                if not server_config.get("username") and server_config.get("sftp_username"):
+                                    server_config["username"] = server_config.get("sftp_username")
+                                if not server_config.get("password") and server_config.get("sftp_password"):
+                                    server_config["password"] = server_config.get("sftp_password")
+                                
+                                # Add the original server ID if needed - CRITICAL for correct path construction
+                                if not server_config.get("original_server_id") and original_server_id:
+                                    server_config["original_server_id"] = original_server_id
+                                    logger.info(f"Added original_server_id {original_server_id} to server config")
+                                
+                                # Use the complete configuration - this will bypass most resolution issues
+                                logger.info(f"Historical parse will use complete server configuration with original_server_id={server_config.get('original_server_id')}")
+                                
+                                # Pass guild_id for proper isolation
+                                guild_id_str = str(ctx.guild_id) if hasattr(ctx, 'guild_id') else (str(ctx.guild.id) if ctx.guild else None)
+                                
+                                # Call the historical parse with direct configuration
+                                files_processed, events_processed = await csv_processor_cog.run_historical_parse_with_config(
+                                    server_id, 
+                                    server_config,
+                                    days=30,
+                                    guild_id=guild_id_str
+                                )
+                            else:
+                                # Fall back to standard parse if we couldn't find configuration
+                                logger.warning(f"Could not find complete server configuration, falling back to standard parse")
                                 parse_id = original_server_id if original_server_id else server_id
-                                logger.error(f"Error retrieving server from database: {db_err}")
-                                logger.warning(f"Falling back to original ID for historical parse: {parse_id}")
-                            
-                            logger.info(f"Starting historical parse task for server {parse_id} (from {server_id})")
-                            
-                            # Use a longer lookback period (30 days) for initial setup
-                            # Pass along the guild_id parameter for proper server isolation
-                            guild_id_str = str(ctx.guild_id) if hasattr(ctx, 'guild_id') else (str(ctx.guild.id) if ctx.guild else None)
-                            logger.info(f"Using guild_id {guild_id_str} for historical parse isolation")
-                            
-                            files_processed, events_processed = await csv_processor_cog.run_historical_parse(
-                                parse_id, 
-                                days=30,
-                                guild_id=guild_id_str
-                            )
+                                
+                                # Pass guild_id for proper isolation
+                                guild_id_str = str(ctx.guild_id) if hasattr(ctx, 'guild_id') else (str(ctx.guild.id) if ctx.guild else None)
+                                
+                                files_processed, events_processed = await csv_processor_cog.run_historical_parse(
+                                    parse_id, 
+                                    days=30,
+                                    guild_id=guild_id_str
+                                )
                             
                             # Log the results
                             logger.info(f"Historical parse complete for server {server_id}: processed {files_processed} files with {events_processed} events")
