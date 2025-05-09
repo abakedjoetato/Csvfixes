@@ -343,9 +343,14 @@ class Setup(commands.Cog):
                             logger.info(f"Waiting {delay_seconds} seconds before starting historical parse for server {server_id} to ensure database writes are complete")
                             await asyncio.sleep(delay_seconds)
                             
-                            logger.info(f"Starting historical parse task for server {server_id}")
+                            # CRITICAL: Use original_server_id for path construction consistency
+                            # We must use the original numeric ID (7020) for consistency across all operations
+                            # This ensures that the historical parse uses the same paths as the log processor
+                            original_id = original_server_id if original_server_id else server_id
+                            logger.info(f"Starting historical parse task for server {original_id} (from {server_id})")
+                            
                             # Use a longer lookback period (30 days) for initial setup
-                            files_processed, events_processed = await csv_processor_cog.run_historical_parse(server_id, days=30)
+                            files_processed, events_processed = await csv_processor_cog.run_historical_parse(original_id, days=30)
                             
                             # Log the results
                             logger.info(f"Historical parse complete for server {server_id}: processed {files_processed} files with {events_processed} events")

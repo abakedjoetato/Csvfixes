@@ -250,38 +250,63 @@ class LogProcessorCog(commands.Cog):
             # Create a new SFTP client for this server if not already existing
             if server_id and server_id not in self.sftp_managers:
                 logger.info(f"Creating new SFTPManager for server {server_id}")
-                # Create SFTPManager with the correct parameter mapping
-                # Get original_server_id if it exists - this is the numeric ID for path construction
-                original_server_id = config.get("original_server_id")
                 
-                # Extract numeric ID from server name or other identifiers
-                numeric_id = None
-                # Try hostname first (often contains the numeric ID)
-                if hostname and '_' in hostname:
+                # Import server_identity module for consistent ID resolution
+                from utils.server_identity import identify_server, KNOWN_SERVERS
+                
+                # First check if this server is in KNOWN_SERVERS for highest priority
+                if server_id in KNOWN_SERVERS:
+                    original_server_id = KNOWN_SERVERS[server_id]
+                    logger.info(f"Using known numeric ID '{original_server_id}' from KNOWN_SERVERS mapping")
+                    
+                    # Update config with correct numeric ID
+                    config["original_server_id"] = original_server_id
+                else:
+                    # Next try getting original_server_id from config
+                    original_server_id = config.get("original_server_id")
+                    
+                    # Check if original_server_id is a UUID instead of numeric ID
+                    if original_server_id and not original_server_id.isdigit() and len(original_server_id) > 10:
+                        # Looks like a UUID - see if it's in KNOWN_SERVERS
+                        if original_server_id in KNOWN_SERVERS:
+                            numeric_id = KNOWN_SERVERS[original_server_id]
+                            logger.info(f"Mapped UUID original_server_id to numeric ID {numeric_id}")
+                            original_server_id = numeric_id
+                    
+                    # If still no original_server_id, use the server_identity module
+                    if not original_server_id:
+                        # Get server properties for identification
+                        server_name = config.get("server_name", "")
+                        guild_id = config.get("guild_id")
+                        
+                        # Identify server using consistent resolution function
+                        numeric_id, is_known = identify_server(
+                            server_id=server_id,
+                            hostname=hostname,
+                            server_name=server_name,
+                            guild_id=guild_id
+                        )
+                        
+                        # Use the identified numeric ID if available
+                        if is_known:
+                            original_server_id = numeric_id
+                            logger.info(f"Using known numeric ID '{numeric_id}' from server_identity module")
+                        elif numeric_id:
+                            original_server_id = numeric_id
+                            logger.info(f"Using identified numeric ID '{numeric_id}' from server_identity module")
+                    else:
+                        logger.info(f"Using original_server_id from config: {original_server_id}")
+                
+                # Fall back to extracting numeric ID from hostname if still not identified
+                if not original_server_id and hostname and '_' in hostname:
                     hostname_parts = hostname.split('_')
                     potential_id = hostname_parts[-1]
                     if potential_id.isdigit():
-                        numeric_id = potential_id
-                        logger.info(f"Extracted numeric ID '{numeric_id}' from hostname: {hostname}")
+                        original_server_id = potential_id
+                        logger.info(f"Extracted numeric ID '{original_server_id}' from hostname: {hostname}")
                 
-                # If we didn't find a numeric ID in hostname, check server_name field
-                if not numeric_id and "server_name" in config:
-                    server_name = config["server_name"]
-                    # Look for numeric sequences in server name
-                    for word in str(server_name).split():
-                        if word.isdigit() and len(word) >= 4:
-                            numeric_id = word
-                            logger.info(f"Extracted numeric ID '{numeric_id}' from server name: {server_name}")
-                            break
-                
-                # Use extracted numeric ID if we found one and original_server_id isn't already set
-                if numeric_id and not original_server_id:
-                    original_server_id = numeric_id
-                    logger.info(f"Using extracted numeric ID for path construction: {numeric_id}")
-                
-                if original_server_id:
-                    logger.info(f"Using original server ID for path construction: {original_server_id}")
-                else:
+                # Last resort: Fall back to UUID
+                if not original_server_id:
                     logger.warning(f"No numeric/original server ID found, using UUID as fallback: {server_id}")
                     original_server_id = server_id  # Fallback to UUID
 
@@ -303,34 +328,53 @@ class LogProcessorCog(commands.Cog):
                 sftp_path = config.get("sftp_path", "/Logs")
 
                 # PRIORITY: Look up the numeric server ID ('7020') for path construction
-                # This is the same ID used by the CSV processor
+                # This is the same ID used by the CSV processor - this MUST be consistent
                 path_server_id = None
                 
                 # Method 0: Use server_identity module for consistent server ID resolution
-                from utils.server_identity import identify_server
+                from utils.server_identity import identify_server, KNOWN_SERVERS
                 
                 # Get server properties for identification
                 server_name = config.get("server_name", "") if hasattr(config, 'get') else ""
                 guild_id = config.get("guild_id", None) if hasattr(config, 'get') else None
                 
-                # Get consistent numeric ID for path construction
-                numeric_id, is_known = identify_server(
-                    server_id=server_id,
-                    hostname=hostname,
-                    server_name=server_name,
-                    guild_id=guild_id
-                )
-                
-                # Use the identified ID if it's a known server or different from what we have
-                if is_known:
-                    path_server_id = numeric_id
-                    logger.info(f"Using known numeric ID '{numeric_id}' for Emeralds Killfeed server")
-                else:
-                    # Method 1: Get original_server_id directly from config if available
-                    original_id = config.get("original_server_id")
-                    if original_id:
+                # Check if this server is in KNOWN_SERVERS first - this has highest priority
+                # This ensures we get the numeric ID (e.g., 7020) for Emeralds Killfeed and other known servers
+                if server_id in KNOWN_SERVERS:
+                    path_server_id = KNOWN_SERVERS[server_id]
+                    logger.info(f"Using known numeric ID '{path_server_id}' from KNOWN_SERVERS for path construction")
+                    
+                    # Update config with the correct numeric ID for future use
+                    if hasattr(config, 'get'):
+                        config["original_server_id"] = path_server_id
+                # Next check if we have original_server_id in config
+                elif original_id := config.get("original_server_id"):
+                    # If the original_id is a UUID, try to find it in KNOWN_SERVERS
+                    if not original_id.isdigit() and len(original_id) > 10:
+                        # Looks like a UUID, check if it's a key in KNOWN_SERVERS
+                        if original_id in KNOWN_SERVERS:
+                            path_server_id = KNOWN_SERVERS[original_id]
+                            logger.info(f"Mapped UUID original_server_id to numeric ID {path_server_id}")
+                        else:
+                            path_server_id = original_id
+                            logger.info(f"Using original_server_id from config for path construction: {original_id}")
+                    else:
+                        # Looks like a numeric ID, use it directly
                         path_server_id = original_id
-                        logger.info(f"Using original server ID from config: {original_id}")
+                        logger.info(f"Using original_server_id from config for path construction: {original_id}")
+                else:
+                    # Get consistent numeric ID for path construction using server_identity module
+                    numeric_id, is_known = identify_server(
+                        server_id=server_id,
+                        hostname=hostname,
+                        server_name=server_name,
+                        guild_id=guild_id
+                    )
+                    
+                    # Use the identified ID if it's a known server
+                    if is_known:
+                        path_server_id = numeric_id
+                        logger.info(f"Using known numeric ID '{numeric_id}' for server {server_id}")
                     
                     # Method 2: Try getting the SFTPManager for this server to see if it has original_server_id
                     if not path_server_id and server_id in self.sftp_managers:

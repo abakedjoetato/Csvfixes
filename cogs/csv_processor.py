@@ -992,10 +992,36 @@ class CSVProcessorCog(commands.Cog):
         """
         # Import safe standardization function
         from utils.server_utils import safe_standardize_server_id
+        # Import server identity resolver for consistent ID handling
+        from utils.server_identity import identify_server, KNOWN_SERVERS
 
         # Standardize server ID - always returns a string, never None
         raw_server_id = server_id if server_id is not None else ""
         server_id = safe_standardize_server_id(raw_server_id)
+        
+        # CRITICAL FIX: Check if this is a numeric ID (like "7020") being used directly
+        # If so, we need to find the corresponding UUID in our database
+        original_numeric_id = None
+        if server_id and server_id.isdigit():
+            # This might be an original_server_id (numeric ID) passed directly
+            original_numeric_id = server_id
+            logger.info(f"Received numeric ID {original_numeric_id} for historical parse")
+            
+            # Look for a matching server in KNOWN_SERVERS by value
+            found_uuid = None
+            for uuid, numeric in KNOWN_SERVERS.items():
+                if str(numeric) == original_numeric_id:
+                    found_uuid = uuid
+                    logger.info(f"Mapped numeric ID {original_numeric_id} to UUID {found_uuid}")
+                    break
+            
+            if found_uuid:
+                # Store the original numeric ID for path construction later
+                server_id = found_uuid
+                # Make sure we add the original_server_id to the config later
+            else:
+                logger.warning(f"Could not find UUID for numeric ID {original_numeric_id} in KNOWN_SERVERS")
+        
         logger.info(f"Starting historical parse for server {raw_server_id} (standardized to {server_id}), looking back {days} days")
 
         # Get server config
@@ -1005,8 +1031,17 @@ class CSVProcessorCog(commands.Cog):
         logger.info(f"Available server configs: {list(server_configs.keys())}")
 
         if server_id not in server_configs:
-            # Try numeric comparison as fallback if server_id is numeric
-            if server_id and str(server_id).isdigit():
+            # Try numeric comparison as fallback if we have an original numeric ID
+            if original_numeric_id:
+                # Look for any server with this original_server_id
+                for config_id, config in server_configs.items():
+                    if str(config.get("original_server_id")) == original_numeric_id:
+                        server_id = config_id
+                        logger.info(f"Found server by original_server_id {original_numeric_id}: {server_id}")
+                        break
+            
+            # If server_id is numeric, try matching as before
+            if server_id not in server_configs and server_id and str(server_id).isdigit():
                 numeric_matches = [sid for sid in server_configs.keys() if str(sid).isdigit() and int(sid) == int(server_id)]
                 if numeric_matches:
                     server_id = numeric_matches[0]

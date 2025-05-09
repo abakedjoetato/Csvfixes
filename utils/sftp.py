@@ -416,16 +416,43 @@ class SFTPManager:
         self.server_id = server_id
         
         # Store numeric server ID for path construction - critical for correct folder paths
-        # If original_server_id is provided, it will be used for path construction
-        self.original_server_id = original_server_id or server_id
+        
+        # First, try to identify the server using server_identity module - this has highest priority
+        try:
+            from utils.server_identity import identify_server, KNOWN_SERVERS
+            
+            # If server is in KNOWN_SERVERS, use the known numeric ID
+            if server_id in KNOWN_SERVERS:
+                numeric_id = KNOWN_SERVERS[server_id]
+                logger.info(f"SFTPClient using known numeric ID '{numeric_id}' for path construction instead of '{server_id}'")
+                self.original_server_id = numeric_id
+            # If original_server_id is explicitly provided, use it (second priority)
+            elif original_server_id:
+                # If it's a UUID, check if it's in KNOWN_SERVERS
+                if not str(original_server_id).isdigit() and len(str(original_server_id)) > 10:
+                    if original_server_id in KNOWN_SERVERS:
+                        numeric_id = KNOWN_SERVERS[original_server_id]
+                        logger.info(f"SFTPClient mapped UUID original_server_id '{original_server_id}' to numeric ID '{numeric_id}'")
+                        self.original_server_id = numeric_id
+                    else:
+                        self.original_server_id = original_server_id
+                else:
+                    self.original_server_id = original_server_id
+            # Otherwise, use server_id as fallback
+            else:
+                self.original_server_id = server_id
+        except (ImportError, Exception) as e:
+            # If server_identity module import fails, fall back to original logic
+            logger.warning(f"Could not import server_identity module, falling back to basic ID resolution: {e}")
+            self.original_server_id = original_server_id or server_id
         
         # Ensure original_server_id is a string 
         if self.original_server_id is not None:
             self.original_server_id = str(self.original_server_id)
         
         # Always log the server ID being used for path construction
-        if original_server_id and original_server_id != server_id:
-            logger.info(f"Using original server ID '{original_server_id}' for path construction instead of standardized ID '{server_id}'")
+        if self.original_server_id != server_id:
+            logger.info(f"Using original server ID '{self.original_server_id}' for path construction instead of standardized ID '{server_id}'")
         else:
             logger.info(f"Using server ID '{server_id}' for path construction")
         self.client = None
