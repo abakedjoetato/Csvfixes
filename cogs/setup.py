@@ -346,11 +346,35 @@ class Setup(commands.Cog):
                             # CRITICAL: Use original_server_id for path construction consistency
                             # We must use the original numeric ID (7020) for consistency across all operations
                             # This ensures that the historical parse uses the same paths as the log processor
-                            original_id = original_server_id if original_server_id else server_id
-                            logger.info(f"Starting historical parse task for server {original_id} (from {server_id})")
+                            
+                            # Retrieve the server from the database to ensure we have the most up-to-date data
+                            try:
+                                server_doc = await self.bot.db.servers.find_one({"server_id": server_id})
+                                if server_doc:
+                                    # Use the server_id from the database for consistency
+                                    db_server_id = server_doc.get("server_id")
+                                    db_original_id = server_doc.get("original_server_id")
+                                    
+                                    # Log the retrieved server information
+                                    logger.info(f"Retrieved server from database: id={db_server_id}, original_id={db_original_id}")
+                                    
+                                    # We want to use the original_server_id if it exists, otherwise use the server_id
+                                    parse_id = db_original_id if db_original_id else (original_server_id if original_server_id else server_id)
+                                    logger.info(f"Using ID {parse_id} for historical parse")
+                                else:
+                                    # Fall back to the original ID if we can't find the server in the database
+                                    parse_id = original_server_id if original_server_id else server_id
+                                    logger.warning(f"Could not find server {server_id} in database, falling back to {parse_id}")
+                            except Exception as db_err:
+                                # If there's an error retrieving from the database, fall back to the original ID
+                                parse_id = original_server_id if original_server_id else server_id
+                                logger.error(f"Error retrieving server from database: {db_err}")
+                                logger.warning(f"Falling back to original ID for historical parse: {parse_id}")
+                            
+                            logger.info(f"Starting historical parse task for server {parse_id} (from {server_id})")
                             
                             # Use a longer lookback period (30 days) for initial setup
-                            files_processed, events_processed = await csv_processor_cog.run_historical_parse(original_id, days=30)
+                            files_processed, events_processed = await csv_processor_cog.run_historical_parse(parse_id, days=30)
                             
                             # Log the results
                             logger.info(f"Historical parse complete for server {server_id}: processed {files_processed} files with {events_processed} events")
