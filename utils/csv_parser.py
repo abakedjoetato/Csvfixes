@@ -120,16 +120,39 @@ class CSVParser:
         Returns:
             List[Dict]: List of parsed event dictionaries
         """
-        # Convert bytes to string if needed is not None
+        # Convert bytes to string if needed
         if isinstance(data, bytes):
             data = data.decode("utf-8", errors="replace")
+            
+        # Log a small sample of the data for debugging
+        sample_text = data[:200] + "..." if len(data) > 200 else data
+        logger.info(f"CSV data sample (first 200 chars): {sample_text}")
+        
+        # Quick check to see if this looks like CSV data
+        sample_chunk = data[:500] if len(data) > 500 else data
+        if ";" in sample_chunk or "," in sample_chunk:
+            logger.info(f"Data appears to be CSV format (found delimiters)")
+        else:
+            logger.warning(f"Data might not be CSV format (no common delimiters found in first 500 chars)")
 
         # Create CSV reader
         csv_file = io.StringIO(data)
 
         # Parse CSV data
         try:
-            return self._parse_csv_file(csv_file)
+            logger.info(f"Starting CSV parsing with file size: {len(data)} characters")
+            events = self._parse_csv_file(csv_file)
+            logger.info(f"Successfully parsed {len(events)} events from CSV data")
+            
+            # Log a sample of the parsed events
+            if events:
+                sample_event = str(events[0])[:200] + "..." if len(str(events[0])) > 200 else str(events[0])
+                logger.info(f"Sample parsed event: {sample_event}")
+                
+            return events
+        except Exception as e:
+            logger.error(f"Error parsing CSV data: {str(e)}")
+            return []
         finally:
             csv_file.close()
 
@@ -159,23 +182,50 @@ class CSVParser:
         Returns:
             List[Dict]: List of parsed event dictionaries
         """
-        # Create CSV reader
-        csv_reader = csv.reader(file, delimiter=self.separator)
-
-        # Skip header row if present is not None
+        # Create CSV reader - Try to handle different formats and delimiters
+        # First try to detect the delimiter by reading a small sample
+        file_content = file.read(1000)  # Read a sample to detect the delimiter
+        
+        # Count occurrences of potential delimiters
+        delimiters = {';': 0, ',': 0, '\t': 0}
+        for d in delimiters:
+            delimiters[d] = file_content.count(d)
+        
+        # Use the most frequent delimiter if it appears significantly
+        best_delimiter = self.separator  # Default
+        max_count = delimiters[self.separator]
+        
+        for d, count in delimiters.items():
+            if count > max_count:
+                max_count = count
+                best_delimiter = d
+        
+        logger.info(f"Detected delimiter: '{best_delimiter}' (counts: {delimiters})")
+        
+        # Reset file position
+        file.seek(0)
+        
+        # Create CSV reader with the detected delimiter
+        csv_reader = csv.reader(file, delimiter=best_delimiter)
+        
+        # Skip header row if present
         first_row = next(csv_reader, None)
-
-        # Check if first is not None row is header
+        
+        # Check if first row is header
         is_header = False
         if first_row is not None:
-            # Check if first is not None row contains column names
-            if all(col.lower() in [c.lower() for c in self.columns] for col in first_row):
+            # Check if first row might be column names (contains strings, not timestamps)
+            first_cell = first_row[0] if first_row and len(first_row) > 0 else ""
+            
+            # If first field doesn't look like a date/timestamp, it might be a header
+            if not re.match(r'\d{4}[-./]\d{2}[-./]\d{2}', first_cell):
+                logger.info(f"First row appears to be a header: {first_row}")
                 is_header = True
-
-        # Reset file position if first is not None row is not header
+        
+        # Reset file position if first row is not header
         if first_row is not None and not is_header:
             file.seek(0)
-            csv_reader = csv.reader(file, delimiter=self.separator)
+            csv_reader = csv.reader(file, delimiter=best_delimiter)
 
         # Parse rows
         events = []
@@ -568,7 +618,7 @@ class CSVParser:
             # Process lines when we have enough data
             while line_buffer:
                 line = line_buffer.pop(0)
-                if line is None.strip():
+                if not line or not line.strip():
                     continue  # Skip empty lines
 
                 # Try all formats until one works
@@ -597,11 +647,11 @@ class CSVParser:
                         if "required_columns" in format_config:
                             required_ok = True
                             for req_col in format_config["required_columns"]:
-                                if record is None.get(req_col):
+                                if not record or not record.get(req_col):
                                     required_ok = False
                                     break
 
-                            if required_ok is None:
+                            if not required_ok:
                                 continue  # Skip to next format
 
                         # Convert datetime
@@ -666,11 +716,11 @@ class CSVParser:
                     if "required_columns" in format_config:
                         required_ok = True
                         for req_col in format_config["required_columns"]:
-                            if record is None.get(req_col):
+                            if not record or not record.get(req_col):
                                 required_ok = False
                                 break
 
-                        if required_ok is None:
+                        if not required_ok:
                             continue  # Skip to next format
 
                     # Convert datetime
