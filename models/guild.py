@@ -88,37 +88,107 @@ class Guild(BaseModel):
         if server_data is None or server_data.get("server_id") is None or server_data.get("server_id") == "":
             return False
             
-        # Ensure original_server_id is present - crucial for path construction
-        if "original_server_id" not in server_data or not server_data["original_server_id"]:
-            server_id = server_data.get("server_id")
-            logger.info(f"No original_server_id found in server data for server {server_id}")
+        # CRITICAL FIX: Ensure original_server_id is ALWAYS a numeric ID for path construction
+        # This is the most important part of the solution to the UUID path issue
+        server_id = server_data.get("server_id")
+        original_server_id = server_data.get("original_server_id")
+        hostname = server_data.get("hostname", server_data.get("sftp_host", ""))
+        server_name = server_data.get("server_name", "")
+        
+        # Import server_identity for consistent ID resolution
+        try:
+            from utils.server_identity import identify_server, KNOWN_SERVERS
             
-            # Try to extract original_server_id from the server name (common practice)
-            # or use the server_id itself if it's not in UUID format
-            server_name = server_data.get("server_name", "")
-            original_server_id = None
-            
-            # If server_id is not in UUID format, use it directly
-            if server_id and ("-" not in server_id or len(server_id) < 30):
-                logger.info(f"Using non-UUID server_id as original_server_id: {server_id}")
-                original_server_id = server_id
-            # Otherwise try to extract from server name
+            # 1. Priority 1: Check KNOWN_SERVERS for both server_id and original_server_id
+            if server_id in KNOWN_SERVERS:
+                numeric_id = KNOWN_SERVERS[server_id]
+                logger.info(f"Using known numeric ID '{numeric_id}' from KNOWN_SERVERS for server {server_id}")
+                server_data["original_server_id"] = numeric_id
+            elif original_server_id and original_server_id in KNOWN_SERVERS:
+                numeric_id = KNOWN_SERVERS[original_server_id]
+                logger.info(f"Using known numeric ID '{numeric_id}' from KNOWN_SERVERS for original_server_id {original_server_id}")
+                server_data["original_server_id"] = numeric_id
+                
+            # 2. Priority 2: If original_server_id is provided and is numeric, use it directly
+            elif original_server_id and str(original_server_id).isdigit():
+                logger.info(f"Using existing numeric original_server_id: {original_server_id}")
+                # Keep existing value - already set
+                
+            # 3. Priority 3: Extract from server name (often contains numeric IDs)
             elif server_name:
-                # Look for numeric ID in server name
+                # Look for numeric ID in server name (common pattern: "Server 7020" or "EU 7020")
+                found = False
                 for word in str(server_name).split():
                     if word.isdigit() and len(word) >= 4:
-                        logger.info(f"Found potential numeric server ID in server_name: {word}")
-                        original_server_id = word
+                        logger.info(f"Found numeric ID in server name: {word}")
+                        server_data["original_server_id"] = word
+                        found = True
                         break
+                        
+                # 4. Priority 4: Try server_identity resolution if nothing found in server name
+                if not found:
+                    numeric_id, is_known = identify_server(
+                        server_id=server_id,
+                        hostname=hostname,
+                        server_name=server_name,
+                        guild_id=self.guild_id
+                    )
+                    
+                    if numeric_id:
+                        logger.info(f"Using identified numeric ID '{numeric_id}' from server_identity module")
+                        server_data["original_server_id"] = numeric_id
+                        found = True
+                        
+                # 5. Priority 5: Extract digits from server_id as last resort
+                if not found and server_id:
+                    # Get numeric part of UUID if possible
+                    uuid_digits = ''.join(filter(str.isdigit, str(server_id)))
+                    if uuid_digits:
+                        extracted_id = uuid_digits[-5:] if len(uuid_digits) >= 5 else uuid_digits
+                        logger.warning(f"Using extracted digits from server_id: {extracted_id}")
+                        server_data["original_server_id"] = extracted_id
+                    else:
+                        # Absolute last resort: Generate a random numeric ID
+                        import random
+                        fallback_id = str(random.randint(10000, 99999))
+                        logger.error(f"Could not determine any numeric ID, using random fallback: {fallback_id}")
+                        server_data["original_server_id"] = fallback_id
             
-            # Set the original_server_id in server_data
-            if original_server_id:
-                logger.info(f"Setting original_server_id to {original_server_id} for server {server_id}")
-                server_data["original_server_id"] = original_server_id
-            else:
-                # Fallback to using server_id if we couldn't find a better alternative
-                logger.warning(f"Could not find a numeric server ID, using server_id as fallback: {server_id}")
-                server_data["original_server_id"] = server_id
+            # 6. Catch-all for any case where we still don't have an original_server_id
+            if "original_server_id" not in server_data or not server_data["original_server_id"]:
+                # Last attempt with server_identity
+                numeric_id, is_known = identify_server(
+                    server_id=server_id,
+                    hostname=hostname,
+                    server_name="", 
+                    guild_id=self.guild_id
+                )
+                
+                if numeric_id:
+                    logger.info(f"Final attempt: using identified numeric ID '{numeric_id}'")
+                    server_data["original_server_id"] = numeric_id
+                else:
+                    # Absolute final fallback
+                    import random
+                    fallback_id = str(random.randint(10000, 99999))
+                    logger.error(f"No valid numeric ID could be found, using random fallback: {fallback_id}")
+                    server_data["original_server_id"] = fallback_id
+                    
+        except ImportError as e:
+            logger.error(f"Failed to import server_identity, using basic fallback: {e}")
+            # Simple fallback if server_identity can't be imported
+            if not original_server_id:
+                # Extract from server name
+                for word in str(server_name).split():
+                    if word.isdigit() and len(word) >= 4:
+                        server_data["original_server_id"] = word
+                        break
+                else:
+                    # Use server_id digits as fallback
+                    if server_id:
+                        uuid_digits = ''.join(filter(str.isdigit, str(server_id)))
+                        extracted_id = uuid_digits[-5:] if len(uuid_digits) >= 5 else uuid_digits
+                        server_data["original_server_id"] = extracted_id or server_id
                 
         logger.info(f"Adding server with server_id={server_data.get('server_id')} and original_server_id={server_data.get('original_server_id')}")
 

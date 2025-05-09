@@ -477,9 +477,42 @@ class Server(BaseModel):
             Server object or None if creation failed
         """
         import uuid
-
+        
         # Create server ID
         server_id = str(uuid.uuid4())
+        
+        # IMPORTANT: Extract numeric ID from server name if not provided
+        from utils.server_identity import identify_server
+        
+        if not original_server_id:
+            logger.info(f"No original_server_id provided, attempting to extract from name: '{name}'")
+            # Try to extract numeric ID from server name or construct a useful one
+            for word in str(name).split():
+                # Look for numeric parts that are at least 4 digits
+                if word.isdigit() and len(word) >= 4:
+                    original_server_id = word
+                    logger.info(f"Found numeric ID in server name: {original_server_id}")
+                    break
+                    
+            # If we still don't have an original_server_id, ask server_identity module
+            if not original_server_id:
+                numeric_id, is_known = identify_server(
+                    server_id=server_id,
+                    hostname=hostname or sftp_host,
+                    server_name=name,
+                    guild_id=guild_id
+                )
+                
+                if numeric_id:
+                    original_server_id = numeric_id
+                    logger.info(f"Using identified numeric ID '{numeric_id}' for path construction")
+        
+        # If we still don't have a numeric ID, create one from last 4 digits of UUID
+        if not original_server_id:
+            # Extract the last 4-5 digits of the UUID as a fallback numeric ID
+            uuid_digits = ''.join(filter(str.isdigit, server_id))
+            original_server_id = uuid_digits[-5:] if len(uuid_digits) >= 5 else uuid_digits
+            logger.warning(f"No numeric ID found, using extracted digits from UUID: {original_server_id}")
 
         # Check if server is not None with this name already exists for this guild
         existing_server = await cls.get_by_name(db, name, guild_id)

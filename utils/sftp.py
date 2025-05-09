@@ -417,32 +417,106 @@ class SFTPManager:
         
         # Store numeric server ID for path construction - critical for correct folder paths
         
-        # First, try to identify the server using server_identity module - this has highest priority
+        # ALWAYS get a numeric ID for path construction - critical fix for UUID path issues
         try:
             from utils.server_identity import identify_server, KNOWN_SERVERS
             
-            # If server is in KNOWN_SERVERS, use the known numeric ID
+            # Default to original_server_id if provided, will be overridden by better options
+            self.original_server_id = original_server_id or server_id
+            
+            # 1. Priority 1: Check KNOWN_SERVERS mapping for server_id (highest authority)
             if server_id in KNOWN_SERVERS:
                 numeric_id = KNOWN_SERVERS[server_id]
                 logger.info(f"SFTPClient using known numeric ID '{numeric_id}' for path construction instead of '{server_id}'")
                 self.original_server_id = numeric_id
-            # If original_server_id is explicitly provided, use it (second priority)
-            elif original_server_id:
-                # If it's a UUID, check if it's in KNOWN_SERVERS
-                if not str(original_server_id).isdigit() and len(str(original_server_id)) > 10:
-                    if original_server_id in KNOWN_SERVERS:
-                        numeric_id = KNOWN_SERVERS[original_server_id]
-                        logger.info(f"SFTPClient mapped UUID original_server_id '{original_server_id}' to numeric ID '{numeric_id}'")
+                
+            # 2. Priority 2: If original_server_id is provided and is numeric, use it directly
+            elif original_server_id and str(original_server_id).isdigit():
+                logger.info(f"SFTPClient using provided numeric original_server_id: {original_server_id}")
+                # Already set in default above
+                
+            # 3. Priority 3: If original_server_id is provided but is a UUID, try to map it
+            elif original_server_id and len(str(original_server_id)) > 10:
+                # Check if UUID original_server_id is in KNOWN_SERVERS
+                if original_server_id in KNOWN_SERVERS:
+                    numeric_id = KNOWN_SERVERS[original_server_id]
+                    logger.info(f"SFTPClient mapped UUID original_server_id '{original_server_id}' to numeric ID '{numeric_id}'")
+                    self.original_server_id = numeric_id
+                else:
+                    # Use server_identity module to resolve the UUID
+                    numeric_id, is_known = identify_server(
+                        server_id=original_server_id,
+                        hostname=hostname,
+                        server_name=server_id  # Use server_id as fallback server_name
+                    )
+                    
+                    if numeric_id:
+                        logger.info(f"SFTPClient resolved UUID '{original_server_id}' to numeric ID '{numeric_id}'")
                         self.original_server_id = numeric_id
                     else:
-                        self.original_server_id = original_server_id
-                else:
-                    self.original_server_id = original_server_id
-            # Otherwise, use server_id as fallback
-            else:
+                        # Extract digits from UUID as last resort
+                        uuid_digits = ''.join(filter(str.isdigit, str(original_server_id)))
+                        if uuid_digits:
+                            extracted_id = uuid_digits[-5:] if len(uuid_digits) >= 5 else uuid_digits
+                            logger.warning(f"SFTPClient extracting numeric ID from UUID: {extracted_id}")
+                            self.original_server_id = extracted_id
+            
+            # 4. Priority 4: If we have a non-UUID server_id, use it directly if numeric
+            elif server_id and str(server_id).isdigit():
+                logger.info(f"SFTPClient using numeric server_id directly: {server_id}")
                 self.original_server_id = server_id
+                
+            # 5. Priority 5: No direct numeric ID found, use server_identity to find one
+            else:
+                # Use all available information for best match
+                numeric_id, is_known = identify_server(
+                    server_id=server_id,
+                    hostname=hostname,
+                    server_name="",  # No name available at this level
+                    guild_id=None  # No guild ID available at this level
+                )
+                
+                if numeric_id:
+                    logger.info(f"SFTPClient using identified numeric ID '{numeric_id}' for path construction")
+                    self.original_server_id = numeric_id
+                else:
+                    # Last resort: Extract digits from server_id
+                    uuid_digits = ''.join(filter(str.isdigit, str(server_id)))
+                    if uuid_digits:
+                        extracted_id = uuid_digits[-5:] if len(uuid_digits) >= 5 else uuid_digits
+                        logger.warning(f"SFTPClient emergency fallback: using digits from server_id: {extracted_id}")
+                        self.original_server_id = extracted_id
+                    else:
+                        # Absolute last resort: Use random numeric ID
+                        import random
+                        fallback_id = str(random.randint(10000, 99999))
+                        logger.error(f"SFTPClient could not determine any numeric ID, using random fallback: {fallback_id}")
+                        self.original_server_id = fallback_id
+            
+            # Ensure original_server_id is a string
+            self.original_server_id = str(self.original_server_id)
+            logger.info(f"Using original server ID '{self.original_server_id}' for path construction")
+            
         except (ImportError, Exception) as e:
-            # If server_identity module import fails, fall back to original logic
+            # If server_identity module import fails, set a safe default
+            logger.error(f"Error in server identity resolution: {e}")
+            
+            # Set a fallback ID
+            if original_server_id:
+                self.original_server_id = original_server_id
+            elif server_id and str(server_id).isdigit():
+                self.original_server_id = server_id
+            else:
+                # Extract numeric parts from server_id
+                uuid_digits = ''.join(filter(str.isdigit, str(server_id)))
+                if uuid_digits:
+                    self.original_server_id = uuid_digits[-5:] if len(uuid_digits) >= 5 else uuid_digits
+                else:
+                    # Last resort random numeric ID
+                    import random
+                    self.original_server_id = str(random.randint(10000, 99999))
+            
+            logger.warning(f"Using fallback original_server_id: {self.original_server_id}")
             logger.warning(f"Could not import server_identity module, falling back to basic ID resolution: {e}")
             self.original_server_id = original_server_id or server_id
         
@@ -1507,7 +1581,7 @@ class SFTPClient:
             await self.disconnect()
             return False
 
-    @retryable(max_retries=2, delay=1.0, backoff=2.0, 
+    @retryable(max_retries=3, delay=1.0, backoff=2.0, 
                exceptions=(asyncio.TimeoutError, ConnectionError, OSError))
     async def connect(self) -> bool:
         """Connect to SFTP server with retries and exponential backoff
@@ -1518,6 +1592,16 @@ class SFTPClient:
         Returns:
             True if connected successfully, False otherwise
         """
+        # Track memory usage before connection attempt
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+            logger.debug(f"Memory before SFTP connection: {memory_mb:.2f}MB")
+        except (ImportError, Exception):
+            pass
+
         # If we already have a working connection, use it
         if self._connected and self._sftp_client and await self.check_connection():
             return True
@@ -1530,6 +1614,7 @@ class SFTPClient:
 
         # Add jitter to prevent connection stampedes
         jitter = random.uniform(0, 0.5) * self._connection_attempts
+        await asyncio.sleep(jitter)  # Actually use the jitter value
 
         # Prevent too many rapid connection attempts
         if self._connection_attempts > 5:
@@ -1538,6 +1623,9 @@ class SFTPClient:
             await asyncio.sleep(30)
             self._connection_attempts = 1
 
+        # For cleanup in finally block
+        temp_ssh_client = None
+        
         try:
             # Check required credentials and validate hostname
             if not self.hostname or not self.username:
@@ -1553,15 +1641,22 @@ class SFTPClient:
 
             # Use asyncio timeout for more reliable timeouts
             async with asyncio.timeout(self.timeout):
-                # Create asyncssh connection
-                self._ssh_client = await asyncssh.connect(
+                # Create asyncssh connection with improved settings
+                temp_ssh_client = await asyncssh.connect(
                     host=self.hostname,
                     port=self.port,
                     username=self.username,
                     password=self.password,
                     known_hosts=None,  # Disable known hosts check
-                    connect_timeout=self.timeout
+                    connect_timeout=self.timeout,
+                    login_timeout=self.timeout,
+                    keepalive_interval=30,   # Send keepalive every 30 seconds
+                    keepalive_count_max=3    # Disconnect after 3 failed keepalives
                 )
+                
+                # Only assign to instance var after successful connection
+                self._ssh_client = temp_ssh_client
+                temp_ssh_client = None  # Prevent double close in finally block
 
                 # Get SFTP client
                 self._sftp_client = await self._ssh_client.start_sftp_client()
@@ -1572,6 +1667,23 @@ class SFTPClient:
             elapsed = (datetime.now() - start_time).total_seconds()
 
             logger.info(f"Connected to SFTP server: {self.connection_id} in {elapsed:.2f}s")
+            
+            # Test connection with simple operation
+            try:
+                await self._sftp_client.listdir('/')
+                logger.debug(f"SFTP connection verified with test operation")
+            except Exception as e:
+                logger.warning(f"SFTP connection test failed, but connection established: {e}")
+                # Continue despite test failure
+            
+            # Trigger garbage collection after connection
+            try:
+                import gc
+                collected = gc.collect()
+                logger.debug(f"GC after SFTP connection: {collected} objects collected")
+            except Exception:
+                pass
+                
             return True
 
         except (asyncio.TimeoutError, ConnectionRefusedError, asyncssh.DisconnectError) as e:
@@ -1598,19 +1710,23 @@ class SFTPClient:
             self.last_error = f"{type(e).__name__}: {str(e)}"
 
             # Log with full stack trace for debugging
-            logger.error(f"Failed to connect to SFTP server {self.connection_id}: {e}")
-
-            # Check if we need to retry or give up
+            logger.error(f"Unexpected error connecting to SFTP server {self.connection_id}: {self.last_error}", 
+                        exc_info=True)
+            
+            # If we've exceeded max attempts, don't raise (stops retries)
             if self._connection_attempts >= self.max_retries:
-                logger.warning(f"Maximum connection attempts ({self.max_retries}) reached for {self.connection_id}. Giving up.")
                 return False
-
-            # Add delay with jitter before retry to prevent thundering herd
-            delay = min(10, (2 ** self._connection_attempts) + jitter)
-            logger.info(f"Will retry connection to {self.connection_id} in {delay:.2f} seconds...")
-
-            # Convert to a connection error for retry handling by decorator
-            raise ConnectionError(f"SFTP connection failed: {str(e)}")
+                
+            # Otherwise propagate for retry
+            raise
+            
+        finally:
+            # Clean up temporary SSH client if it exists and wasn't assigned
+            if temp_ssh_client:
+                try:
+                    temp_ssh_client.close()
+                except Exception:
+                    pass
 
     async def disconnect(self):
         """Disconnect from SFTP server and clean up resources"""

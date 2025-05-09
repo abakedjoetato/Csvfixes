@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple, Protocol, TypeVar, cast, Union, Coroutine
 
@@ -100,32 +101,79 @@ class LogProcessorCog(commands.Cog):
             except Exception as e:
                 logger.error(f"Error disconnecting SFTP for server {server_id}: {e}")
 
-    @tasks.loop(minutes=1.0)
+    @tasks.loop(minutes=2.0)  # Reduced frequency from 1min to 2min to save resources
     async def process_logs_task(self):
         """Background task for processing game log files
 
-        This task runs every 1 minute and checks for new log entries on all configured servers.
+        This task runs every 2 minutes (reduced from 1) to check for new log entries 
+        while maintaining lower resource usage.
         """
         if self.is_processing:
             logger.debug("Skipping log processing - already running")
             return
 
+        # Check if we should skip based on memory usage
+        try:
+            import psutil
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_mb = memory_info.rss / 1024 / 1024
+            
+            # Skip if memory usage is too high
+            if memory_mb > 500:  # 500MB limit
+                logger.warning(f"Skipping log processing due to high memory usage: {memory_mb:.2f}MB")
+                return
+                
+        except ImportError:
+            pass  # psutil not available, continue anyway
+        except Exception as e:
+            logger.error(f"Error checking memory usage: {e}")
+            
         self.is_processing = True
+        start_time = time.time()
 
         try:
             # Get list of configured servers
             server_configs = await self._get_server_configs()
+            
+            # Skip processing if no SFTP-enabled servers are configured
+            if not server_configs:
+                logger.debug("No SFTP-enabled servers configured, skipping log processing")
+                return
+                
+            # Report number of servers to process
+            logger.info(f"Processing logs for {len(server_configs)} servers")
 
+            # Process each server with timeout protection
             for server_id, config in server_configs.items():
+                # Check if we've been processing too long
+                if time.time() - start_time > 120:  # 2 minute total limit
+                    logger.warning("Log processing taking too long, stopping after current server")
+                    break
+                    
                 try:
-                    await self._process_server_logs(server_id, config)
+                    # Set a timeout for this server's processing
+                    try:
+                        await asyncio.wait_for(
+                            self._process_server_logs(server_id, config),
+                            timeout=60  # 1 minute timeout per server
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Log processing timed out for server {server_id}")
+                        continue  # Skip to next server
                 except Exception as e:
                     logger.error(f"Error processing logs for server {server_id}: {str(e)}")
+                    continue  # Skip to next server on error
+                    
+                # Brief pause between servers to reduce resource spikes
+                await asyncio.sleep(1)
 
         except Exception as e:
             logger.error(f"Error in log processing task: {str(e)}")
-
+            
         finally:
+            duration = time.time() - start_time
+            logger.info(f"Log processing completed in {duration:.2f} seconds")
             self.is_processing = False
 
     @process_logs_task.before_loop

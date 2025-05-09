@@ -48,3 +48,4 @@ pydantic
 pytz
 requests
 sqlalchemy
+psutil

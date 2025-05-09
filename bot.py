@@ -230,17 +230,46 @@ async def initialize_bot(force_sync=False):
             except Exception as e:
                 logger.error(f"Error during server data synchronization: {e}", exc_info=True)
         
-        # Start SFTP connection maintenance task
-        if 'sftp_maintenance' not in bot.background_tasks or bot.background_tasks['sftp_maintenance'].done():
-            logger.info("Starting SFTP connection maintenance task")
-            bot.background_tasks['sftp_maintenance'] = asyncio.create_task(
-                periodic_connection_maintenance(interval=120)  # Run every 2 minutes
+        # Start SFTP connection maintenance task with improved error resilience
+        if 'sftp_maintenance' not in bot.background_tasks or (
+            bot.background_tasks['sftp_maintenance'] and bot.background_tasks['sftp_maintenance'].done()
+        ):
+            logger.info("Starting SFTP connection maintenance task with automatic restart")
+            
+            # Create a wrapper task that uses our resilient task runner
+            task_wrapper = asyncio.create_task(
+                run_background_tasks_with_restart(
+                    bot, 
+                    lambda: periodic_connection_maintenance(interval=120), 
+                    interval=120,
+                    name="sftp_maintenance",
+                    max_failures=5  # Allow more retries before giving up
+                ),
+                name="sftp_maintenance_wrapper"
             )
-            # Add error handler to prevent unhandled task exceptions
-            bot.background_tasks['sftp_maintenance'].add_done_callback(
-                lambda t: logger.error(f"SFTP maintenance task stopped: {t.exception()}") 
-                if t.exception() else None
-            )
+            
+            # Store the wrapper task
+            bot.background_tasks['sftp_maintenance'] = task_wrapper
+            
+            # Add extra error handler as a safety net
+            def task_error_handler(task):
+                if task.done() and not task.cancelled():
+                    try:
+                        exc = task.exception()
+                        if exc:
+                            logger.error(f"SFTP maintenance task failed with unhandled exception: {exc}", exc_info=exc)
+                            # Log stack trace for debugging
+                            import traceback
+                            logger.error(f"Task stack trace: {traceback.format_exception(type(exc), exc, exc.__traceback__)}")
+                    except asyncio.CancelledError:
+                        # Task was cancelled, which is normal during shutdown
+                        logger.info("SFTP maintenance task was cancelled")
+                    except Exception as e:
+                        # Error extracting exception info
+                        logger.error(f"Error checking task exception: {e}")
+            
+            # Add our enhanced error handler
+            bot.background_tasks['sftp_maintenance'].add_done_callback(task_error_handler)
         
         if force_sync:
             logger.info("Syncing application commands...")
@@ -381,6 +410,43 @@ async def initialize_bot(force_sync=False):
     logger.info(f"Successfully loaded {cog_count} cogs")
     return bot
 
+async def run_background_tasks_with_restart(bot, task_func, interval, name, max_failures=3):
+    """Run a background task with automatic restart on failure
+    
+    Args:
+        bot: Bot instance
+        task_func: Async function to run periodically
+        interval: Interval in seconds
+        name: Task name for logging
+        max_failures: Maximum number of consecutive failures before giving up
+    """
+    failures = 0
+    while True:
+        try:
+            logger.info(f"Starting background task: {name}")
+            await task_func()
+            # If we get here, the task completed normally, so reset failure count
+            failures = 0
+        except asyncio.CancelledError:
+            logger.warning(f"Background task {name} was cancelled")
+            return
+        except Exception as e:
+            failures += 1
+            logger.error(f"Background task {name} failed (attempt {failures}/{max_failures}): {e}", exc_info=True)
+            
+            if failures >= max_failures:
+                logger.critical(f"Background task {name} failed {failures} times, giving up")
+                bot._background_tasks[name] = None  # Clear the task reference
+                return
+                
+        # Wait before restarting
+        try:
+            logger.info(f"Waiting {interval}s before next {name} execution")
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.info(f"Background task {name} sleep was interrupted, exiting")
+            return
+
 async def run_bot():
     """Run the Discord bot"""
     # Check for token
@@ -389,9 +455,51 @@ async def run_bot():
         logger.error("DISCORD_TOKEN environment variable not set")
         return 1
     
+    # Use a global exception handler for asyncio tasks
+    def global_exception_handler(loop, context):
+        exception = context.get('exception')
+        if exception:
+            logger.error(f"Unhandled exception in asyncio: {str(exception)}", exc_info=exception)
+        else:
+            logger.error(f"Unhandled asyncio error: {context.get('message')}")
+    
     try:
+        # Get the current event loop and set exception handler
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(global_exception_handler)
+        
         # Initialize the bot
         bot = await initialize_bot(force_sync=True)
+        
+        # Create a background task monitor
+        async def monitor_background_tasks():
+            while True:
+                try:
+                    # Check all background tasks
+                    for task_name, task in list(bot._background_tasks.items()):
+                        if task and task.done():
+                            exception = task.exception()
+                            if exception:
+                                logger.error(f"Background task {task_name} raised an exception: {exception}", 
+                                            exc_info=exception)
+                                # Restart the task if it's critical
+                                logger.info(f"Attempting to restart background task: {task_name}")
+                                # Re-create the task based on its name
+                                if task_name == "sftp_maintenance":
+                                    new_task = asyncio.create_task(
+                                        run_background_tasks_with_restart(bot, periodic_connection_maintenance, 120, task_name)
+                                    )
+                                    bot._background_tasks[task_name] = new_task
+                            else:
+                                logger.warning(f"Background task {task_name} completed unexpectedly")
+                except Exception as e:
+                    logger.error(f"Error in background task monitor: {e}")
+                
+                # Check every 30 seconds
+                await asyncio.sleep(30)
+        
+        # Start the monitor task
+        monitor_task = asyncio.create_task(monitor_background_tasks(), name="task_monitor")
         
         # Start the bot
         logger.info("Starting bot...")
@@ -399,6 +507,9 @@ async def run_bot():
     except discord.LoginFailure:
         logger.error("Invalid token provided")
         return 1
+    except asyncio.CancelledError:
+        logger.warning("Bot was cancelled during startup")
+        return 2
     except Exception as e:
         logger.error(f"Error starting bot: {e}")
         import traceback
@@ -408,7 +519,14 @@ async def run_bot():
 
 def main():
     """Main entry point"""
-    return asyncio.run(run_bot())
+    try:
+        return asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by keyboard interrupt")
+        return 0
+    except Exception as e:
+        logger.critical(f"Unhandled exception in main: {e}", exc_info=True)
+        return 1
 
 if __name__ == "__main__":
     sys.exit(main())
