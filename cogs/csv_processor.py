@@ -99,8 +99,10 @@ class CSVProcessorCog(commands.Cog):
 
         This task runs every 5 minutes to check for new CSV files and process them promptly.
         """
+        logger.warning(f"CRITICAL DEBUG: Starting CSV processor task at {datetime.now().strftime('%H:%M:%S')}")
+        
         if self.is_processing:
-            logger.debug("Skipping CSV processing - already running")
+            logger.warning("CRITICAL DEBUG: Skipping CSV processing - already running")
             return
 
         # Check if we should skip based on memory usage
@@ -414,9 +416,13 @@ class CSVProcessorCog(commands.Cog):
             last_time = start_date
             logger.info(f"Using provided start_date for CSV processing: {last_time.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
-            # TEMPORARY FIX: Use a much older date to ensure processing of files for debugging
-            last_time = self.last_processed.get(server_id, datetime.now() - timedelta(days=60))
-            logger.info(f"DEBUGGING: Using older last processed time to ensure CSV processing: {last_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            # IMPORTANT ENHANCEMENT: Force processing of recent files regardless of last_processed time
+            # Set the cutoff date to 60 days ago to ensure we process all recent files for debugging
+            last_time = datetime.now() - timedelta(days=60)
+            # Override any existing last_processed entry with our debug value
+            self.last_processed[server_id] = last_time
+            logger.info(f"CRITICAL DEBUG: Using a 60-day cutoff for CSV processing: {last_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"CRITICAL DEBUG: This will ensure all files from the last 60 days are processed")
 
         # Format for SFTP directory listing comparison
         last_time_str = last_time.strftime("%Y.%m.%d-%H.%M.%S")
@@ -1023,6 +1029,22 @@ class CSVProcessorCog(commands.Cog):
                         
                         # Debug: Print the cutoff date for comparison
                         logger.info(f"DEBUG CSV: Using cutoff date: {last_time_str} for file filtering")
+                        logger.warning(f"CRITICAL DEBUG: Found {len(csv_files)} CSV files, about to filter by date using cutoff {last_time_str}")
+                        
+                        # MAJOR DEBUG: Log the first 5 files found
+                        first_files = [os.path.basename(f) for f in csv_files[:5]]
+                        logger.warning(f"CRITICAL DEBUG: First 5 files found: {first_files}")
+                        
+                        # MAJOR DEBUG: Force include all files regardless of date
+                        new_files = csv_files.copy()
+                        skipped_files = []
+                        logger.warning(f"CRITICAL DEBUG: Forcing inclusion of all {len(new_files)} CSV files for processing!")
+                        
+                        # Skip the usual date-based filtering
+                        # But still log filenames for debugging
+                        for f in csv_files:
+                            filename = os.path.basename(f)
+                            logger.warning(f"CRITICAL DEBUG: Including file {filename} for forced processing")
                         
                         for f in csv_files:
                             # Get just the filename without the path
@@ -1051,12 +1073,16 @@ class CSVProcessorCog(commands.Cog):
                                     # Convert string format back to datetime for comparison
                                     last_time_date = datetime.strptime(last_time_str, "%Y.%m.%d-%H.%M.%S")
                                     
-                                    # Compare as datetime objects
-                                    if file_date > last_time_date:
-                                        logger.info(f"File date {file_date} is newer than last processed {last_time_date}")
+                                    # IMPORTANT FIX: Always include files if they're within the last 7 days
+                                    # regardless of last_processed time to ensure we don't miss any data
+                                    seven_days_ago = datetime.now() - timedelta(days=7)
+                                    
+                                    # Compare as datetime objects with special case for recent files
+                                    if file_date > last_time_date or file_date >= seven_days_ago:
+                                        logger.info(f"FIXED: Including file {filename} with date {file_date} (last_processed={last_time_date}, 7_days_ago={seven_days_ago})")
                                         new_files.append(f)
                                     else:
-                                        logger.info(f"File date {file_date} is older than last processed {last_time_date}")
+                                        logger.info(f"File date {file_date} is older than last processed {last_time_date} and older than 7 days")
                                         skipped_files.append(f)
                                 except ValueError as e:
                                     # Try alternative date formats - primary format is yyyy.mm.dd-hh.mm.ss as confirmed by user
@@ -1069,12 +1095,15 @@ class CSVProcessorCog(commands.Cog):
                                             logger.info(f"Successfully parsed date {file_date_str} as {file_date}")
                                             parsed = True
                                             
-                                            # Compare as datetime objects
-                                            if file_date > last_time_date:
-                                                logger.info(f"File date {file_date} is newer than last processed {last_time_date}")
+                                            # Apply the same logic as above - include files from last 7 days
+                                            seven_days_ago = datetime.now() - timedelta(days=7)
+                                            
+                                            # Compare as datetime objects with special case for recent files
+                                            if file_date > last_time_date or file_date >= seven_days_ago:
+                                                logger.info(f"FIXED: Including file {filename} with date {file_date} using alternate format")
                                                 new_files.append(f)
                                             else:
-                                                logger.info(f"File date {file_date} is older than last processed {last_time_date}")
+                                                logger.info(f"File date {file_date} is older than last processed {last_time_date} and older than 7 days")
                                                 skipped_files.append(f)
                                             break
                                         except ValueError:
@@ -1138,7 +1167,11 @@ class CSVProcessorCog(commands.Cog):
                                 
                         # Sort files by their embedded date for chronological processing
                         sorted_files = sorted(new_files, key=get_file_date)
-                        logger.info(f"Sorted {len(sorted_files)} files chronologically for processing")
+                        logger.warning(f"CRITICAL DEBUG: Sorted {len(sorted_files)} files chronologically for processing")
+                        if sorted_files:
+                            logger.warning(f"CRITICAL DEBUG: First 3 sorted files: {[os.path.basename(f) for f in sorted_files[:3]]}")
+                        else:
+                            logger.warning("CRITICAL DEBUG: No files to process after sorting!")
                         
                         # Determine which files to process based on historical vs. regular processing
                         # - Historical processor will read all CSV files
@@ -1151,21 +1184,28 @@ class CSVProcessorCog(commands.Cog):
                         else:
                             logger.info("No start date provided, using default 24-hour window")
                             
-                        if is_historical_mode:
-                            logger.info("Running in historical mode - processing all lines from all files")
-                            files_to_process = sorted_files
-                            only_new_lines = False  # Process all lines in historical mode
-                        else:
-                            # Regular processing - process all files but only new lines
-                            if sorted_files:
-                                logger.info(f"Running in standard killfeed mode - processing only new lines from {len(sorted_files)} files")
-                                # Process all applicable files
-                                files_to_process = sorted_files
-                                only_new_lines = True  # Only process new lines
-                            else:
-                                logger.info("No files to process after date filtering")
-                                files_to_process = []
-                                only_new_lines = False
+                        # OVERRIDE FOR DEBUGGING: Force historical mode to ensure all files are processed
+                        is_historical_mode = True
+                        logger.warning("CRITICAL DEBUG: FORCING historical mode to process all files completely")
+                        files_to_process = sorted_files
+                        only_new_lines = False  # Process all lines
+                        
+                        # Original logic (commented out for testing)
+                        # if is_historical_mode:
+                        #     logger.info("Running in historical mode - processing all lines from all files")
+                        #     files_to_process = sorted_files
+                        #     only_new_lines = False  # Process all lines in historical mode
+                        # else:
+                        #     # Regular processing - process all files but only new lines
+                        #     if sorted_files:
+                        #         logger.info(f"Running in standard killfeed mode - processing only new lines from {len(sorted_files)} files")
+                        #         # Process all applicable files
+                        #         files_to_process = sorted_files
+                        #         only_new_lines = True  # Only process new lines
+                        #     else:
+                        #         logger.info("No files to process after date filtering")
+                        #         files_to_process = []
+                        #         only_new_lines = False
                                 
                         logger.info(f"CSV processing mode: Historical={is_historical_mode}, " + 
                                   f"Start date={start_date}, Files to process={len(files_to_process)}")
@@ -1187,19 +1227,30 @@ class CSVProcessorCog(commands.Cog):
                             try:
                                 # Download file content - use the correct path
                                 file_path = file  # file is already the full path
-                                logger.info(f"Downloading CSV file from: {file_path}")
+                                logger.warning(f"CRITICAL DEBUG: Now downloading CSV file from: {file_path}")
                                 
                                 # Special handling for local files in the attached_assets directory
                                 if 'attached_assets' in file_path:
-                                    logger.info(f"Using local file reading for {file_path}")
+                                    logger.warning(f"CRITICAL DEBUG: Using local file reading for {file_path}")
                                     try:
                                         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                                             content = f.read()
+                                            logger.warning(f"CRITICAL DEBUG: Successfully read local file {file_path} ({len(content)} bytes)")
                                     except Exception as e:
-                                        logger.error(f"Error reading local file {file_path}: {e}")
+                                        logger.error(f"CRITICAL DEBUG: Error reading local file {file_path}: {e}")
                                         content = None
                                 else:
-                                    content = await sftp.download_file(file_path)
+                                    try:
+                                        logger.warning(f"CRITICAL DEBUG: Downloading SFTP file: {file_path}")
+                                        content = await sftp.download_file(file_path)
+                                        if content:
+                                            content_bytes = len(content) if content else 0
+                                            logger.warning(f"CRITICAL DEBUG: Successfully downloaded {file_path} ({content_bytes} bytes)")
+                                        else:
+                                            logger.error(f"CRITICAL DEBUG: SFTP download returned None for {file_path}")
+                                    except Exception as e:
+                                        logger.error(f"CRITICAL DEBUG: Exception during SFTP download of {file_path}: {str(e)}")
+                                        content = None
 
                                 if content:
                                     content_length = len(content) if hasattr(content, '__len__') else 0
