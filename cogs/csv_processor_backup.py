@@ -14,8 +14,15 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Union, Tuple
 
 import discord
-from discord.ext import commands, tasks
-from discord import app_commands
+from discord.ext import commands
+# Ensure discord_compat is imported for py-cord compatibility
+from utils.discord_compat import get_app_commands_module
+app_commands = get_app_commands_module(), tasks
+# Use compatibility layer to handle different Discord library versions
+from utils.discord_compat import get_app_commands_module, AppCommandOptionType
+
+# Get the appropriate app_commands module for the current Discord library
+app_commands = get_app_commands_module()
 
 from utils.csv_parser import CSVParser
 from utils.sftp import SFTPManager

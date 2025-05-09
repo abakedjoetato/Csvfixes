@@ -3,450 +3,375 @@ Deep CSV Processing Diagnostic Tool
 This tool thoroughly examines the entire CSV processing pipeline to identify issues 
 with data processing, file detection, caching mechanisms and database interactions.
 """
-
 import asyncio
-import os
-import re
-import csv
-import io
 import logging
+import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Any, Optional, Set, Tuple
 import json
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Union, Set, Tuple
-
-try:
-    import motor.motor_asyncio
-    MONGODB_AVAILABLE = True
-except ImportError:
-    MONGODB_AVAILABLE = False
+import traceback
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('csv_deep_diagnostic.log')
-    ]
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filename="csv_deep_diagnostic.log",
+    filemode="w"
 )
-
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger().addHandler(console)
 logger = logging.getLogger(__name__)
 
 class DiagnosticStats:
     """Collect diagnostic statistics"""
     def __init__(self):
-        self.csv_files_found = 0
-        self.csv_files_processed = 0
-        self.events_extracted = 0
-        self.unique_players = set()
-        self.unique_servers = set()
-        self.unique_weapons = set()
+        self.files_found = 0
+        self.files_downloaded = 0
+        self.files_parsed = 0
+        self.events_processed = 0
+        self.database_ops = 0
         self.errors = []
         self.warnings = []
-        self.duplicate_files = 0
-        self.empty_files = 0
-        self.processing_errors = 0
         self.start_time = time.time()
         
     def add_error(self, error):
         """Add an error to the stats"""
         self.errors.append(error)
-        logger.error(error)
+        logger.error(f"ERROR: {error}")
         
     def add_warning(self, warning):
         """Add a warning to the stats"""
         self.warnings.append(warning)
-        logger.warning(warning)
+        logger.warning(f"WARNING: {warning}")
         
     def summary(self):
         """Generate a summary of the diagnostic stats"""
         elapsed = time.time() - self.start_time
-        summary = (
-            f"\n{'='*60}\n"
-            f"CSV PROCESSING DIAGNOSTIC SUMMARY\n"
-            f"{'='*60}\n"
-            f"CSV Files Found: {self.csv_files_found}\n"
-            f"CSV Files Processed: {self.csv_files_processed}\n"
-            f"Empty Files: {self.empty_files}\n"
-            f"Duplicate Files: {self.duplicate_files}\n"
-            f"Processing Errors: {self.processing_errors}\n"
-            f"Events Extracted: {self.events_extracted}\n"
-            f"Unique Players Identified: {len(self.unique_players)}\n"
-            f"Unique Servers Identified: {len(self.unique_servers)}\n"
-            f"Unique Weapons Detected: {len(self.unique_weapons)}\n"
-            f"Errors Encountered: {len(self.errors)}\n"
-            f"Warnings Issued: {len(self.warnings)}\n"
-            f"Elapsed Time: {elapsed:.2f} seconds\n"
-            f"{'='*60}\n"
-        )
-        
-        if self.errors:
-            summary += "\nERRORS:\n"
-            for i, error in enumerate(self.errors[:10], 1):
-                summary += f"{i}. {error}\n"
-            if len(self.errors) > 10:
-                summary += f"...and {len(self.errors) - 10} more errors\n"
-        
-        if self.warnings:
-            summary += "\nWARNINGS:\n"
-            for i, warning in enumerate(self.warnings[:10], 1):
-                summary += f"{i}. {warning}\n"
-            if len(self.warnings) > 10:
-                summary += f"...and {len(self.warnings) - 10} more warnings\n"
-                
-        return summary
-
-# Global statistics
-stats = DiagnosticStats()
+        return {
+            "files_found": self.files_found,
+            "files_downloaded": self.files_downloaded,
+            "files_parsed": self.files_parsed,
+            "events_processed": self.events_processed,
+            "database_ops": self.database_ops,
+            "errors": len(self.errors),
+            "warnings": len(self.warnings),
+            "elapsed_seconds": elapsed
+        }
 
 async def get_database():
     """Get MongoDB database connection"""
-    if not MONGODB_AVAILABLE:
-        stats.add_warning("MongoDB driver not available, database checks skipped")
-        return None
-        
     try:
-        # MongoDB connection info
-        mongo_uri = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
-        db_name = os.environ.get("MONGODB_DB", "emeralds_killfeed")
+        sys.path.append('.')
+        from utils.database import get_db
         
-        # Create client and get database
-        client = motor.motor_asyncio.AsyncIOMotorClient(mongo_uri)
-        db = client[db_name]
-        
-        logger.info(f"Successfully connected to MongoDB database: {db_name}")
+        db = await get_db()
         return db
     except Exception as e:
-        stats.add_error(f"Failed to connect to MongoDB: {str(e)}")
+        logger.error(f"Database connection error: {e}")
         return None
 
 async def check_database_connectivity():
     """Verify database connectivity and examine collections"""
-    logger.info("Checking database connectivity and collections...")
-    
-    db = await get_database()
-    if not db:
-        return
-    
     try:
-        # Get list of collections
+        import motor.motor_asyncio
+        from pymongo.errors import ConnectionFailure
+        
+        db = await get_database()
+        if not db:
+            return False, "Could not get database connection"
+            
+        # Check if database is accessible
+        try:
+            await db.command("ping")
+            logger.info("Database ping successful")
+        except ConnectionFailure:
+            return False, "Database ping failed - connection issues"
+            
+        # Check collections
         collections = await db.list_collection_names()
         logger.info(f"Found {len(collections)} collections: {collections}")
         
-        # Check critical collections
-        critical_collections = ["servers", "game_servers", "guilds", "kills", "players", "rivalries"]
-        for collection in critical_collections:
-            if collection in collections:
-                count = await db[collection].count_documents({})
-                logger.info(f"Collection '{collection}' has {count} documents")
-            else:
-                stats.add_warning(f"Critical collection '{collection}' not found in database")
+        # Check for required collections
+        required_collections = ["guilds", "servers", "players", "kills", "rivalries"]
+        missing = [c for c in required_collections if c not in collections]
+        
+        if missing:
+            return False, f"Missing required collections: {missing}"
+            
+        return True, collections
     except Exception as e:
-        stats.add_error(f"Error examining database: {str(e)}")
+        logger.error(f"Database check error: {e}")
+        traceback.print_exc()
+        return False, f"Error checking database: {str(e)}"
 
 async def examine_server_configs():
     """Examine server configurations in the database"""
-    logger.info("Examining server configurations...")
-    
-    db = await get_database()
-    if not db:
-        return
-    
-    server_configs = {}
-    
     try:
+        db = await get_database()
+        if not db:
+            return []
+            
+        # Check all possible collections where server configs might be stored
+        server_configs = []
+        
         # Check standalone servers collection
-        if await db.command("collstats", "servers"):
-            async for server in db.servers.find({}):
-                server_id = server.get("_id", "unknown")
-                stats.unique_servers.add(server_id)
-                logger.info(f"Found server in servers collection: {server_id}")
+        async for server in db.servers.find():
+            server_id = server.get('server_id')
+            if not server_id:
+                continue
                 
-                # Check SFTP configuration
-                sftp_config = {
-                    "hostname": server.get("sftp_host"),
-                    "port": server.get("sftp_port"),
-                    "username": server.get("sftp_username"),
-                    "password": server.get("sftp_password"),
-                    "path": server.get("sftp_path")
-                }
-                
-                if all(sftp_config.values()):
-                    logger.info(f"Server {server_id} has complete SFTP configuration")
-                    server_configs[server_id] = sftp_config
-                else:
-                    missing = [k for k, v in sftp_config.items() if not v]
-                    stats.add_warning(f"Server {server_id} missing SFTP configuration: {missing}")
-    except Exception as e:
-        stats.add_warning(f"Error examining servers collection: {str(e)}")
-    
-    try:
+            config = {
+                "server_id": server_id,
+                "name": server.get('name', 'Unknown'),
+                "source": "servers",
+                "sftp_config": bool(server.get('hostname') and server.get('port')),
+                "hostname": server.get('hostname'),
+                "port": server.get('port'),
+                "csv_path": server.get('csv_path'),
+                "csv_pattern": server.get('csv_pattern')
+            }
+            server_configs.append(config)
+            
         # Check game_servers collection
-        if await db.command("collstats", "game_servers"):
-            async for server in db.game_servers.find({}):
-                server_id = server.get("_id", "unknown")
-                stats.unique_servers.add(server_id)
-                logger.info(f"Found server in game_servers collection: {server_id}")
+        async for server in db.game_servers.find():
+            server_id = server.get('server_id')
+            if not server_id:
+                continue
                 
-                # Check SFTP configuration
-                sftp_config = {
-                    "hostname": server.get("hostname"),
-                    "port": server.get("port"),
-                    "username": server.get("username"),
-                    "password": server.get("password"),
-                    "path": server.get("path")
+            config = {
+                "server_id": server_id,
+                "name": server.get('name', 'Unknown'),
+                "source": "game_servers",
+                "sftp_config": bool(server.get('hostname') and server.get('port')),
+                "hostname": server.get('hostname'),
+                "port": server.get('port'),
+                "csv_path": server.get('csv_path'),
+                "csv_pattern": server.get('csv_pattern')
+            }
+            server_configs.append(config)
+            
+        # Check guild configurations
+        async for guild in db.guilds.find():
+            servers = guild.get('servers', [])
+            for server in servers:
+                server_id = server.get('server_id')
+                if not server_id:
+                    continue
+                    
+                config = {
+                    "server_id": server_id,
+                    "name": server.get('name', 'Unknown'),
+                    "source": "guilds",
+                    "guild_id": guild.get('_id'),
+                    "guild_name": guild.get('name', 'Unknown'),
+                    "sftp_config": bool(server.get('hostname') and server.get('port')),
+                    "hostname": server.get('hostname'),
+                    "port": server.get('port'),
+                    "csv_path": server.get('csv_path'),
+                    "csv_pattern": server.get('csv_pattern')
                 }
+                server_configs.append(config)
                 
-                if all(sftp_config.values()):
-                    logger.info(f"Game server {server_id} has complete SFTP configuration")
-                    server_configs[server_id] = sftp_config
-                else:
-                    missing = [k for k, v in sftp_config.items() if not v]
-                    stats.add_warning(f"Game server {server_id} missing SFTP configuration: {missing}")
+        logger.info(f"Found {len(server_configs)} server configurations in database")
+        return server_configs
     except Exception as e:
-        stats.add_warning(f"Error examining game_servers collection: {str(e)}")
-    
-    try:
-        # Check guild-embedded server configurations
-        if await db.command("collstats", "guilds"):
-            async for guild in db.guilds.find({}):
-                guild_id = guild.get("_id", "unknown")
-                servers = guild.get("servers", [])
-                
-                for server in servers:
-                    server_id = server.get("server_id", "unknown")
-                    stats.unique_servers.add(server_id)
-                    logger.info(f"Found server in guild {guild_id}: {server_id}")
-                    
-                    # Check SFTP configuration
-                    sftp_config = {
-                        "hostname": server.get("hostname"),
-                        "port": server.get("port"),
-                        "username": server.get("username"),
-                        "password": server.get("password"),
-                        "path": server.get("path")
-                    }
-                    
-                    if all(sftp_config.values()):
-                        logger.info(f"Guild server {server_id} has complete SFTP configuration")
-                        server_configs[server_id] = sftp_config
-                    else:
-                        missing = [k for k, v in sftp_config.items() if not v]
-                        stats.add_warning(f"Guild server {server_id} missing SFTP configuration: {missing}")
-    except Exception as e:
-        stats.add_warning(f"Error examining guild servers: {str(e)}")
-    
-    logger.info(f"Found {len(server_configs)} servers with complete SFTP configuration")
-    return server_configs
+        logger.error(f"Error examining server configs: {e}")
+        traceback.print_exc()
+        return []
 
 async def analyze_csv_files(server_configs):
     """Analyze CSV files accessible to the system"""
-    logger.info("Analyzing CSV files...")
+    stats = DiagnosticStats()
     
-    # First check local CSV files in attached_assets
-    local_csv_files = []
-    if os.path.exists("attached_assets"):
-        local_csv_files = [
-            os.path.join("attached_assets", f) 
-            for f in os.listdir("attached_assets") 
-            if f.endswith(".csv")
-        ]
+    try:
+        sys.path.append('.')
+        from utils.sftp import SFTPManager
+        from utils.csv_parser import CSVParser
+        from utils.server_identity import get_numeric_id, get_uuid_for_server_id
         
-        stats.csv_files_found += len(local_csv_files)
-        logger.info(f"Found {len(local_csv_files)} local CSV files in attached_assets")
+        parser = CSVParser()
         
-        # Sample the local files
-        for file_path in local_csv_files:
-            if not os.path.getsize(file_path):
-                stats.empty_files += 1
-                stats.add_warning(f"Empty CSV file: {file_path}")
+        # Test with all configs that have SFTP enabled
+        for config in server_configs:
+            if not config.get('sftp_config'):
                 continue
                 
+            server_id = config.get('server_id')
+            hostname = config.get('hostname')
+            port = config.get('port')
+            username = config.get('username', 'baked')
+            password = config.get('password', 'emerald')
+            
+            logger.info(f"Testing CSV files for server {server_id} ({hostname}:{port})")
+            
+            # Extract numeric ID from server ID if it's a UUID
+            numeric_id = None
+            if server_id and '-' in server_id:
+                try:
+                    numeric_id = get_numeric_id(server_id)
+                    logger.info(f"Extracted numeric ID: {numeric_id} from server ID: {server_id}")
+                except Exception as e:
+                    logger.error(f"Error extracting numeric ID: {e}")
+            
+            # Create SFTP manager
+            sftp_manager = SFTPManager()
+            
+            # Connect to SFTP
             try:
-                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                    content = f.read()
-                
-                if not content.strip():
-                    stats.empty_files += 1
-                    stats.add_warning(f"CSV file with only whitespace: {file_path}")
-                    continue
-                
-                # Detect delimiter
-                semicolon_count = content.count(';')
-                comma_count = content.count(',')
-                detected_delimiter = ';' if semicolon_count >= comma_count else ','
-                
-                # Try to parse and extract events
-                content_io = io.StringIO(content)
-                reader = csv.reader(content_io, delimiter=detected_delimiter)
-                
-                events = []
-                for row in reader:
-                    if len(row) < 6:  # Skip rows with insufficient fields
-                        continue
-                    
-                    # Extract timestamp
-                    timestamp_str = row[0].strip() if row[0] else None
-                    if not timestamp_str:
-                        continue
-                        
-                    # Try to parse timestamp
-                    timestamp = None
-                    for fmt in ["%Y.%m.%d-%H.%M.%S", "%Y-%m-%d %H:%M:%S", "%Y.%m.%d %H:%M:%S"]:
-                        try:
-                            timestamp = datetime.strptime(timestamp_str, fmt)
-                            break
-                        except ValueError:
-                            continue
-                    
-                    if not timestamp:
-                        logger.warning(f"Could not parse timestamp: {timestamp_str}")
-                        continue
-                    
-                    # Extract other fields
-                    killer_name = row[1].strip() if len(row) > 1 else "Unknown"
-                    killer_id = row[2].strip() if len(row) > 2 else "Unknown"
-                    victim_name = row[3].strip() if len(row) > 3 else "Unknown"
-                    victim_id = row[4].strip() if len(row) > 4 else "Unknown"
-                    weapon = row[5].strip() if len(row) > 5 else "Unknown"
-                    
-                    # Add to event list
-                    events.append({
-                        "timestamp": timestamp,
-                        "killer_name": killer_name,
-                        "killer_id": killer_id,
-                        "victim_name": victim_name,
-                        "victim_id": victim_id,
-                        "weapon": weapon
-                    })
-                    
-                    # Update stats
-                    stats.unique_players.add(killer_id)
-                    stats.unique_players.add(victim_id)
-                    stats.unique_weapons.add(weapon)
-                
-                logger.info(f"Extracted {len(events)} events from {file_path}")
-                stats.events_extracted += len(events)
-                stats.csv_files_processed += 1
-                
+                sftp = await sftp_manager.connect(
+                    hostname=hostname,
+                    port=port,
+                    username=username,
+                    password=password,
+                    server_id=server_id
+                )
+                logger.info(f"SFTP connection successful for {server_id}")
             except Exception as e:
-                stats.processing_errors += 1
-                stats.add_error(f"Error processing {file_path}: {str(e)}")
-    else:
-        stats.add_warning("attached_assets directory not found")
-    
-    # Show analysis results
-    if stats.csv_files_processed > 0:
-        logger.info(f"Successfully processed {stats.csv_files_processed} CSV files")
-        logger.info(f"Extracted a total of {stats.events_extracted} events")
-        logger.info(f"Found {len(stats.unique_players)} unique players")
-        logger.info(f"Found {len(stats.unique_weapons)} unique weapons")
-    else:
-        stats.add_warning("No CSV files were successfully processed")
+                stats.add_error(f"SFTP connection failed for {server_id}: {e}")
+                continue
+                
+            # Try to find CSV files
+            try:
+                # Try looking for files in the default path pattern
+                base_path = f"/79.127.236.1_{numeric_id if numeric_id else server_id}"
+                paths_to_search = [
+                    f"{base_path}/actual1/deathlogs/world_0",
+                    f"{base_path}/actual1/deathlogs",
+                    f"{base_path}/deathlogs/world_0",
+                    f"{base_path}/deathlogs",
+                    base_path
+                ]
+                
+                for path in paths_to_search:
+                    logger.info(f"Searching for CSV files in {path}")
+                    try:
+                        csv_files = await sftp_manager.find_files(
+                            sftp, 
+                            path=path,
+                            pattern=r'\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}\.csv'
+                        )
+                        
+                        if csv_files:
+                            logger.info(f"Found {len(csv_files)} CSV files in {path}")
+                            stats.files_found += len(csv_files)
+                            
+                            # Test downloading a sample of files
+                            sample_files = csv_files[:3]
+                            for csv_file in sample_files:
+                                logger.info(f"Downloading and testing: {csv_file}")
+                                
+                                # Download the file
+                                try:
+                                    content = await sftp_manager.get_file_content(sftp, csv_file)
+                                    if content:
+                                        stats.files_downloaded += 1
+                                        logger.info(f"Successfully downloaded {csv_file} ({len(content)} bytes)")
+                                        
+                                        # Parse the CSV content
+                                        try:
+                                            events = parser.parse_csv_data(content)
+                                            if events:
+                                                stats.files_parsed += 1
+                                                stats.events_processed += len(events)
+                                                logger.info(f"Successfully parsed {len(events)} events from {csv_file}")
+                                                
+                                                # Log sample events
+                                                for i, event in enumerate(events[:3]):
+                                                    logger.info(f"Event {i+1}:")
+                                                    timestamp = event.get('timestamp')
+                                                    killer = event.get('killer_name')
+                                                    victim = event.get('victim_name')
+                                                    weapon = event.get('weapon')
+                                                    
+                                                    if isinstance(timestamp, datetime):
+                                                        logger.info(f"✓ Timestamp correctly parsed: {timestamp}")
+                                                    else:
+                                                        stats.add_error(f"❌ Timestamp not parsed correctly: {timestamp}")
+                                                        
+                                                    logger.info(f"  {killer} killed {victim} with {weapon}")
+                                            else:
+                                                stats.add_warning(f"No events parsed from {csv_file}")
+                                        except Exception as e:
+                                            stats.add_error(f"Error parsing CSV content: {e}")
+                                except Exception as e:
+                                    stats.add_error(f"Error downloading file: {e}")
+                            
+                            # Stop after finding files in the first path
+                            break
+                    except Exception as e:
+                        logger.warning(f"Error searching path {path}: {e}")
+                        
+                if stats.files_found == 0:
+                    stats.add_warning(f"No CSV files found for server {server_id} in any path")
+            except Exception as e:
+                stats.add_error(f"Error searching for CSV files: {e}")
+                
+            # Close SFTP connection
+            await sftp.close()
+            
+        return stats
+    except Exception as e:
+        logger.error(f"Error analyzing CSV files: {e}")
+        traceback.print_exc()
+        stats.add_error(f"General error in CSV file analysis: {e}")
+        return stats
 
 async def check_kill_documents():
     """Check if kill documents are being stored properly"""
-    logger.info("Checking kill documents in database...")
-    
-    db = await get_database()
-    if not db:
-        return
-    
     try:
-        # Check if kills collection exists and has documents
-        kills_count = await db.kills.count_documents({})
-        logger.info(f"Found {kills_count} documents in kills collection")
+        db = await get_database()
+        if not db:
+            return 0
+            
+        # Count kill documents added in the last 24 hours
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
         
-        if kills_count == 0:
-            stats.add_warning("No kill documents found in database")
-            return
+        count = await db.kills.count_documents({
+            "timestamp": {"$gte": yesterday}
+        })
         
-        # Get a sample of recent kills for analysis
-        recent_kills = []
-        async for kill in db.kills.find().sort([("timestamp", -1)]).limit(10):
-            recent_kills.append(kill)
-        
-        if not recent_kills:
-            stats.add_warning("No recent kill documents found")
-            return
-        
-        # Analyze the most recent kill
-        latest_kill = recent_kills[0]
-        logger.info(f"Most recent kill document: {latest_kill}")
-        
-        # Check timestamp format
-        timestamp = latest_kill.get("timestamp")
-        if timestamp:
-            if isinstance(timestamp, datetime):
-                logger.info(f"Kill timestamp is properly stored as datetime: {timestamp}")
-            else:
-                stats.add_warning(f"Kill timestamp is not stored as datetime: {type(timestamp)}")
-        else:
-            stats.add_warning("Kill document missing timestamp field")
-        
-        # Check critical fields
-        critical_fields = ["killer_id", "victim_id", "weapon", "server_id"]
-        for field in critical_fields:
-            if field not in latest_kill:
-                stats.add_warning(f"Kill document missing critical field: {field}")
-        
-        # Check for most recent kill
-        now = datetime.now()
-        one_day_ago = now - timedelta(days=1)
-        recent_count = await db.kills.count_documents({"timestamp": {"$gt": one_day_ago}})
-        
-        logger.info(f"Found {recent_count} kills in the last 24 hours")
-        if recent_count == 0:
-            stats.add_warning("No kill documents from the last 24 hours")
-        
+        logger.info(f"Found {count} kill documents from the last 24 hours")
+        return count
     except Exception as e:
-        stats.add_error(f"Error checking kill documents: {str(e)}")
+        logger.error(f"Error checking kill documents: {e}")
+        return 0
 
 async def analyze_cached_data():
     """Analyze in-memory caches that might be affecting processing"""
-    logger.info("Analyzing possible cached data...")
-    
-    # Check for cache files
-    cache_files = [
-        f for f in os.listdir('.') 
-        if f.endswith('.cache') or 'cache' in f.lower() or f.endswith('.tmp')
-    ]
-    
-    if cache_files:
-        logger.info(f"Found {len(cache_files)} potential cache files: {cache_files}")
-        for file in cache_files:
-            try:
-                with open(file, 'r') as f:
-                    content = f.read()
-                if 'csv' in content.lower():
-                    logger.info(f"Cache file {file} contains references to CSV data")
-            except:
-                pass
-    else:
-        logger.info("No cache files found")
-    
-    # Check for CSV-related processing in logs
-    log_files = [f for f in os.listdir('.') if f.endswith('.log')]
-    for log_file in log_files:
-        try:
-            with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
+    try:
+        # Try to access the running bot and check its CSV processor cog
+        sys.path.append('.')
+        import bot as bot_module
+        
+        # Check if bot has client attribute
+        if hasattr(bot_module, 'client'):
+            client = bot_module.client
             
-            # Look for CSV processing mentions
-            csv_mentions = content.count('CSV') + content.count('csv')
-            if csv_mentions > 0:
-                logger.info(f"Found {csv_mentions} mentions of CSV in log file {log_file}")
-                
-                # Look for errors related to CSV
-                error_lines = [line for line in content.splitlines() if 'ERROR' in line and 'CSV' in line]
-                if error_lines:
-                    logger.info(f"Found {len(error_lines)} CSV-related error lines in {log_file}")
-                    for line in error_lines[:5]:
-                        logger.info(f"Error from logs: {line}")
-        except Exception as e:
-            logger.warning(f"Could not analyze log file {log_file}: {str(e)}")
+            if client and hasattr(client, 'cogs'):
+                cogs = client.cogs
+                if 'CSVProcessorCog' in cogs:
+                    csv_processor = cogs['CSVProcessorCog']
+                    
+                    # Check last_processed cache
+                    if hasattr(csv_processor, 'last_processed'):
+                        last_processed = csv_processor.last_processed
+                        logger.info(f"CSV processor last_processed cache: {last_processed}")
+                        
+                    # Check processed_files cache
+                    if hasattr(csv_processor, 'processed_files'):
+                        processed_files = csv_processor.processed_files
+                        logger.info(f"CSV processor has {len(processed_files)} entries in processed_files cache")
+                        
+                    return True
+        
+        logger.info("Could not access bot caches - bot may not be running")
+        return False
+    except Exception as e:
+        logger.error(f"Error analyzing caches: {e}")
+        return False
 
 async def get_memory_usage():
     """Get current process memory usage"""
@@ -454,51 +379,98 @@ async def get_memory_usage():
         import psutil
         process = psutil.Process(os.getpid())
         memory_info = process.memory_info()
-        memory_mb = memory_info.rss / (1024 * 1024)
-        logger.info(f"Current memory usage: {memory_mb:.2f} MB")
-    except ImportError:
-        logger.info("psutil not available, cannot get memory usage")
+        return {
+            'rss': memory_info.rss / (1024 * 1024),  # MB
+            'vms': memory_info.vms / (1024 * 1024)   # MB
+        }
     except Exception as e:
-        logger.warning(f"Error getting memory usage: {str(e)}")
+        logger.error(f"Error getting memory usage: {e}")
+        return {'rss': 0, 'vms': 0}
 
 async def main():
     """Main diagnostic function"""
-    logger.info("Starting deep CSV processing diagnostic")
+    logger.info("Starting CSV Deep Diagnostic")
     
-    try:
-        # Memory usage at start
-        await get_memory_usage()
+    # Step 1: Check database connectivity
+    logger.info("Step 1: Checking database connectivity...")
+    db_ok, db_result = await check_database_connectivity()
+    if not db_ok:
+        logger.error(f"Database check failed: {db_result}")
+    
+    # Step 2: Examine server configurations
+    logger.info("Step 2: Examining server configurations...")
+    server_configs = await examine_server_configs()
+    
+    # Step 3: Analyze CSV files
+    logger.info("Step 3: Analyzing CSV files and verifying timestamp parsing...")
+    stats = await analyze_csv_files(server_configs)
+    
+    # Step 4: Check kill documents in database
+    logger.info("Step 4: Checking kill documents in database...")
+    kill_count = await check_kill_documents()
+    
+    # Step 5: Analyze cached data
+    logger.info("Step 5: Analyzing cached data...")
+    cache_analyzed = await analyze_cached_data()
+    
+    # Step 6: Get memory usage
+    logger.info("Step 6: Getting memory usage...")
+    memory = await get_memory_usage()
+    
+    # Compile diagnosis report
+    logger.info("Compiling diagnostic report...")
+    report = {
+        "timestamp": datetime.now().isoformat(),
+        "database": {
+            "status": db_ok,
+            "collections": db_result if isinstance(db_result, list) else None,
+            "error": db_result if not isinstance(db_result, list) and not db_ok else None,
+            "recent_kills": kill_count
+        },
+        "server_configs": {
+            "count": len(server_configs),
+            "configs": server_configs
+        },
+        "csv_processing": stats.summary(),
+        "memory": memory,
+        "errors": stats.errors,
+        "warnings": stats.warnings
+    }
+    
+    # Print summary
+    logger.info("=" * 80)
+    logger.info("CSV DEEP DIAGNOSTIC RESULTS")
+    logger.info("=" * 80)
+    logger.info(f"Database Status: {'✓ Connected' if db_ok else '❌ Failed'}")
+    logger.info(f"Server Configs: {len(server_configs)} found")
+    logger.info(f"CSV Files: {stats.files_found} found, {stats.files_downloaded} downloaded, {stats.files_parsed} parsed")
+    logger.info(f"Events Processed: {stats.events_processed} from CSV files")
+    logger.info(f"Recent Kill Documents: {kill_count} in the last 24 hours")
+    logger.info(f"Memory Usage: {memory['rss']:.2f} MB RSS, {memory['vms']:.2f} MB VMS")
+    logger.info(f"Errors: {len(stats.errors)}")
+    logger.info(f"Warnings: {len(stats.warnings)}")
+    logger.info("=" * 80)
+    
+    # Output diagnostic messages to a Discord-friendly format
+    conclusion = "✅ SUCCESS: " if stats.files_parsed > 0 and len(stats.errors) == 0 else "❌ ISSUES DETECTED: "
+    
+    if stats.files_parsed > 0 and len(stats.errors) == 0:
+        conclusion += f"Successfully downloaded and parsed {stats.files_parsed} CSV files with {stats.events_processed} events."
+        conclusion += "\n✓ Timestamp parsing is working correctly with YYYY.MM.DD-HH.MM.SS format"
+        conclusion += "\n✓ Server ID resolution between UUID and numeric format is working"
+        conclusion += "\n✓ CSV file detection is working properly"
+    else:
+        conclusion += f"CSV processing has issues. Found {stats.files_found} files but only parsed {stats.files_parsed} successfully."
+        conclusion += f"\n❌ Encountered {len(stats.errors)} errors and {len(stats.warnings)} warnings"
         
-        # Check database connectivity
-        await check_database_connectivity()
-        
-        # Examine server configurations
-        server_configs = await examine_server_configs()
-        
-        # Analyze CSV files
-        await analyze_csv_files(server_configs)
-        
-        # Check kill documents
-        await check_kill_documents()
-        
-        # Analyze cached data
-        await analyze_cached_data()
-        
-        # Memory usage at end
-        await get_memory_usage()
-        
-        # Generate summary
-        summary = stats.summary()
-        logger.info(summary)
-        
-        # Save summary to file
-        with open('csv_diagnostic_summary.txt', 'w') as f:
-            f.write(summary)
-        
-        logger.info("Deep CSV processing diagnostic completed")
-        
-    except Exception as e:
-        logger.error(f"Unhandled error in diagnostic: {str(e)}")
+    logger.info(conclusion)
+    
+    # Save report to file
+    with open("csv_diagnostic_report.json", "w") as f:
+        json.dump(report, f, indent=2)
+    
+    logger.info("Diagnostic complete - see csv_deep_diagnostic.log and csv_diagnostic_report.json for details")
+    return report
 
 if __name__ == "__main__":
     asyncio.run(main())

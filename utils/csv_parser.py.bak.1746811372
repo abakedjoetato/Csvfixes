@@ -115,12 +115,11 @@ class CSVParser:
         self._last_processed_line_count = {}  # Reset line tracking
         logger.info("CSV parser cache cleared")
 
-    def parse_csv_data(self, data: Union[str, bytes], delimiter: str = None) -> List[Dict[str, Any]]:
+    def parse_csv_data(self, data: Union[str, bytes]) -> List[Dict[str, Any]]:
         """Parse CSV data and return list of events
 
         Args:
             data: CSV data string or bytes
-            delimiter: Optional delimiter to use for CSV parsing (overrides auto-detection)
 
         Returns:
             List[Dict]: List of parsed event dictionaries
@@ -146,7 +145,7 @@ class CSVParser:
         # Parse CSV data
         try:
             logger.info(f"Starting CSV parsing with file size: {len(data)} characters")
-            events = self._parse_csv_file(csv_file, delimiter=delimiter)
+            events = self._parse_csv_file(csv_file)
             logger.info(f"Successfully parsed {len(events)} events from CSV data")
             
             # Log a sample of the parsed events
@@ -161,41 +160,35 @@ class CSVParser:
         finally:
             csv_file.close()
 
-    def parse_csv_file(self, file_path: str, only_new_lines: bool = False, delimiter: str = None) -> List[Dict[str, Any]]:
+    def parse_csv_file(self, file_path: str, only_new_lines: bool = False) -> List[Dict[str, Any]]:
         """Parse CSV file and return list of events
 
         Args:
             file_path: Path to CSV file
             only_new_lines: If True, only parse lines that haven't been processed before
-            delimiter: Optional delimiter to use for CSV parsing (overrides auto-detection)
 
         Returns:
             List[Dict]: List of parsed event dictionaries
         """
         try:
             with open(file_path, "r", encoding="utf-8") as file:
-                return self._parse_csv_file(file, file_path=file_path, only_new_lines=only_new_lines, delimiter=delimiter)
+                return self._parse_csv_file(file, file_path=file_path, only_new_lines=only_new_lines)
         except UnicodeDecodeError:
             # Try with different encoding
             with open(file_path, "r", encoding="latin-1") as file:
-                return self._parse_csv_file(file, file_path=file_path, only_new_lines=only_new_lines, delimiter=delimiter)
+                return self._parse_csv_file(file, file_path=file_path, only_new_lines=only_new_lines)
 
-    def _parse_csv_file(self, file: Union[TextIO, BinaryIO], file_path: str = None, only_new_lines: bool = False, delimiter: str = None) -> List[Dict[str, Any]]:
+    def _parse_csv_file(self, file: Union[TextIO, BinaryIO], file_path: str = None, only_new_lines: bool = False) -> List[Dict[str, Any]]:
         """Parse CSV file and return list of events
 
         Args:
             file: File-like object (can be text or binary)
             file_path: Path to the file (used for tracking processed lines)
             only_new_lines: If True, only parse lines that haven't been processed before
-            delimiter: Optional delimiter to use for CSV parsing (overrides auto-detection)
 
         Returns:
             List[Dict]: List of parsed event dictionaries
         """
-        # Use provided delimiter if specified
-        if delimiter is not None:
-            self.delimiter = delimiter
-            logger.info(f"Using provided delimiter: '{delimiter}'")
         # Handle possible None input
         if file is None:
             logger.error(f"Null file object provided to CSV parser for {file_path or 'unknown path'}")
