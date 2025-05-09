@@ -1,0 +1,1839 @@
+"""
+SFTP connection handler for Tower of Temptation PvP Statistics Bot
+
+This module provides utilities for connecting to game servers via SFTP 
+and retrieving log files. It includes:
+1. Robust error handling with retries
+2. Connection pooling for multi-server support
+3. Timeouts for non-blocking operation
+4. Proper resource cleanup
+5. Multi-guild safe operation
+"""
+import os
+import logging
+import asyncio
+import re
+import io
+import functools
+import random
+import traceback
+from typing import List, Dict, Any, Optional, Tuple, Union, BinaryIO, Set, Callable
+from datetime import datetime, timedelta
+import paramiko
+import asyncssh
+from utils.async_utils import retryable
+
+# Configure module-specific logger
+logger = logging.getLogger(__name__)
+
+# Global connection pool for connection reuse
+CONNECTION_POOL: Dict[str, 'SFTPClient'] = {}
+POOL_LOCK = asyncio.Lock()
+
+# Track active operations to prevent resource conflicts
+ACTIVE_OPERATIONS: Dict[str, Set[str]] = {}
+
+# Track operation timeouts to cleanup stuck operations
+OPERATION_TIMEOUTS: Dict[str, datetime] = {}
+
+def with_operation_tracking(op_name: str, timeout_minutes: int = 5):
+    """Decorator to track and prevent conflicting SFTP operations with timeout handling.
+    
+    This improved decorator tracks operations to prevent conflicts and also adds
+    timeout handling to automatically clean up stuck operations after a timeout period.
+    
+    Args:
+        op_name: Operation name prefix (file path or operation type)
+        timeout_minutes: Number of minutes before operation times out and is forcibly cleaned up
+        
+    Returns:
+        Decorated function that tracks operations to prevent conflicts
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            if not hasattr(self, 'server_id') or not self.server_id:
+                logger.warning(f"Operation {op_name} attempted without server_id")
+                return await func(self, *args, **kwargs)
+                
+            # Create unique operation ID
+            path = ""
+            if args:
+                # Get first argument which is usually the path
+                path = str(args[0]) if args[0] is not None else ""
+            elif kwargs:
+                # Try common parameter names for paths
+                for param_name in ['remote_path', 'path', 'directory']:
+                    if param_name in kwargs and kwargs[param_name] is not None:
+                        path = str(kwargs[param_name])
+                        break
+            
+            operation_id = f"{op_name}:{path}"
+            timeout_key = f"{self.server_id}:{operation_id}"
+            
+            # Get or create tracking set for this server
+            if self.server_id not in ACTIVE_OPERATIONS:
+                ACTIVE_OPERATIONS[self.server_id] = set()
+                
+            # Check if operation is already in progress
+            if operation_id in ACTIVE_OPERATIONS[self.server_id]:
+                # Check if operation has timed out
+                if timeout_key in OPERATION_TIMEOUTS:
+                    if datetime.now() > OPERATION_TIMEOUTS[timeout_key]:
+                        # Operation has timed out, clean it up and proceed
+                        logger.warning(f"Operation {operation_id} for server {self.server_id} has timed out and will be forcibly cleaned up")
+                        ACTIVE_OPERATIONS[self.server_id].discard(operation_id)
+                        OPERATION_TIMEOUTS.pop(timeout_key, None)
+                    else:
+                        logger.warning(f"Operation {operation_id} already in progress for server {self.server_id}")
+                        return None
+                else:
+                    logger.warning(f"Operation {operation_id} already in progress for server {self.server_id}")
+                    return None
+                
+            # Add operation to tracking
+            ACTIVE_OPERATIONS[self.server_id].add(operation_id)
+            
+            # Set timeout for this operation
+            OPERATION_TIMEOUTS[timeout_key] = datetime.now() + timedelta(minutes=timeout_minutes)
+            
+            try:
+                # Execute operation
+                start_time = datetime.now()
+                result = await func(self, *args, **kwargs)
+                elapsed = (datetime.now() - start_time).total_seconds()
+                
+                # Log long-running operations for performance monitoring
+                if elapsed > 5:  # Log operations taking more than 5 seconds
+                    logger.warning(f"Long-running operation {operation_id} for server {self.server_id} took {elapsed:.2f}s")
+                
+                return result
+            except Exception as e:
+                # Log and reraise exception
+                logger.error(f"Error during operation {operation_id} for server {self.server_id}: {str(e)}")
+                raise
+            finally:
+                # Remove operation from tracking and clear timeout
+                if self.server_id in ACTIVE_OPERATIONS:
+                    ACTIVE_OPERATIONS[self.server_id].discard(operation_id)
+                    if not ACTIVE_OPERATIONS[self.server_id]:
+                        ACTIVE_OPERATIONS.pop(self.server_id, None)
+                
+                # Clear timeout
+                OPERATION_TIMEOUTS.pop(timeout_key, None)
+                    
+        return wrapper
+    return decorator
+
+async def cleanup_stale_connections(max_idle_time: int = 300):
+    """Cleanup stale connections in the connection pool
+    
+    This function identifies and removes connections that have been idle for too long,
+    preventing resource exhaustion in environments with many servers.
+    
+    Args:
+        max_idle_time: Maximum idle time in seconds before connection is considered stale
+    """
+    stale_connections = []
+    
+    # Find stale connections
+    async with POOL_LOCK:
+        now = datetime.now()
+        for connection_id, client in list(CONNECTION_POOL.items()):
+            # Check if connection is stale based on last activity
+            if hasattr(client, 'last_activity'):
+                idle_time = (now - client.last_activity).total_seconds()
+                if idle_time > max_idle_time:
+                    logger.info(f"Connection {connection_id} idle for {idle_time:.1f}s, marking as stale")
+                    stale_connections.append(connection_id)
+                elif idle_time > 60:  # Just log connections idle for more than a minute
+                    logger.debug(f"Connection {connection_id} idle for {idle_time:.1f}s")
+    
+    # Disconnect and remove stale connections
+    for connection_id in stale_connections:
+        try:
+            async with POOL_LOCK:
+                if connection_id in CONNECTION_POOL:
+                    client = CONNECTION_POOL[connection_id]
+                    logger.info(f"Cleaning up stale connection: {connection_id}")
+                    await client.disconnect()
+                    CONNECTION_POOL.pop(connection_id, None)
+        except Exception as e:
+            logger.error(f"Error cleaning up stale connection {connection_id}: {e}")
+
+async def cleanup_stuck_operations(max_stuck_time: int = 300):
+    """Cleanup stuck operations that haven't completed within the timeout
+    
+    This function identifies operations that have been running for too long
+    and forcibly removes them from tracking, allowing new operations to proceed.
+    
+    Args:
+        max_stuck_time: Maximum time in seconds before operation is considered stuck
+    """
+    # Find and clean up stuck operations
+    now = datetime.now()
+    stuck_operations = []
+    
+    # Find stuck operations
+    for timeout_key, timeout_time in list(OPERATION_TIMEOUTS.items()):
+        if now > timeout_time:
+            stuck_operations.append(timeout_key)
+    
+    # Clean up stuck operations
+    cleanup_count = 0
+    for timeout_key in stuck_operations:
+        try:
+            server_id, operation_id = timeout_key.split(':', 1)
+            
+            if server_id in ACTIVE_OPERATIONS and operation_id in ACTIVE_OPERATIONS[server_id]:
+                logger.warning(f"Cleaning up stuck operation: {operation_id} for server {server_id}")
+                ACTIVE_OPERATIONS[server_id].discard(operation_id)
+                
+                if not ACTIVE_OPERATIONS[server_id]:
+                    ACTIVE_OPERATIONS.pop(server_id, None)
+                    
+                cleanup_count += 1
+            
+            # Remove timeout tracking
+            OPERATION_TIMEOUTS.pop(timeout_key, None)
+                
+        except Exception as e:
+            logger.error(f"Error cleaning up stuck operation {timeout_key}: {e}")
+    
+    if cleanup_count > 0:
+        logger.info(f"Cleaned up {cleanup_count} stuck operations")
+
+async def periodic_connection_maintenance(interval: int = 60):
+    """Periodically maintain SFTP connection pool
+    
+    This background task runs periodically to clean up stale connections and
+    stuck operations, ensuring the system remains responsive under load.
+    
+    Args:
+        interval: Cleanup interval in seconds
+    """
+    logger.info(f"Starting periodic connection maintenance task (interval: {interval}s)")
+    
+    while True:
+        try:
+            # Delay is at the beginning so we can safely use continue
+            await asyncio.sleep(interval)
+            
+            # Skip if no connections or operations
+            if not CONNECTION_POOL and not OPERATION_TIMEOUTS:
+                continue
+                
+            # Log current state
+            logger.debug(f"Connection pool: {len(CONNECTION_POOL)} connections, "
+                         f"Active operations: {sum(len(ops) for ops in ACTIVE_OPERATIONS.values())}, "
+                         f"Operation timeouts: {len(OPERATION_TIMEOUTS)}")
+            
+            # Cleanup stale connections
+            await cleanup_stale_connections()
+            
+            # Cleanup stuck operations
+            await cleanup_stuck_operations()
+            
+        except asyncio.CancelledError:
+            # Allow clean shutdown
+            logger.info("Connection maintenance task cancelled")
+            break
+        except Exception as e:
+            # Log error but don't stop the maintenance task
+            logger.error(f"Error in connection maintenance: {e}")
+            traceback.print_exc()
+
+async def get_sftp_client(
+    hostname: Optional[str] = None,
+    port: Optional[int] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    timeout: int = 30,
+    max_retries: int = 3,
+    server_id: Optional[str] = None,
+    force_new: bool = False,
+    # Support for alternative parameter naming
+    sftp_host: Optional[str] = None,
+    sftp_port: Optional[int] = None,
+    sftp_username: Optional[str] = None,
+    sftp_password: Optional[str] = None,
+    **kwargs  # For additional parameters
+) -> 'SFTPClient':
+    """Get SFTP client from connection pool or create new one.
+    
+    This factory function supports flexible parameter naming for backward compatibility.
+    
+    Args:
+        hostname: SFTP hostname (primary parameter)
+        port: SFTP port (primary parameter)
+        username: SFTP username (primary parameter)
+        password: SFTP password (primary parameter)
+        timeout: Connection timeout in seconds
+        max_retries: Maximum number of connection retries
+        server_id: Server ID for tracking
+        force_new: Force creation of new connection
+        sftp_host: Alternative parameter for hostname
+        sftp_port: Alternative parameter for port
+        sftp_username: Alternative parameter for username
+        sftp_password: Alternative parameter for password
+        **kwargs: Additional parameters
+        
+    Returns:
+        SFTPClient instance
+    """
+    # Handle parameter normalizing - prioritize the primary params but accept alternative naming
+    combined_host = hostname or sftp_host or kwargs.get('host')
+    initial_port = port or sftp_port or kwargs.get('port') or 22
+    
+    # If hostname has port embedded as hostname:port, extract it
+    if combined_host and ":" in combined_host:
+        hostname_parts = combined_host.split(":")
+        host = hostname_parts[0]  # Extract just the hostname part
+        if len(hostname_parts) > 1 and hostname_parts[1].isdigit():
+            port_num = int(hostname_parts[1])  # Use the port from the combined string
+            logger.info(f"Factory function split hostname:port format: {combined_host} -> hostname: {host}, port: {port_num}")
+        else:
+            host = combined_host
+            port_num = initial_port
+    else:
+        host = combined_host
+        port_num = initial_port
+    
+    user = username or sftp_username or kwargs.get('user')
+    pwd = password or sftp_password or kwargs.get('pwd')
+    
+    # Create connection key
+    if server_id is None:
+        logger.warning("SFTP client requested without server_id, this prevents proper isolation")
+        # Generate a unique ID to avoid conflicts
+        server_id = f"anonymous_{random.randint(1000, 9999)}"
+        
+    conn_key = f"{host}:{port_num}:{user}:{server_id}"
+    
+    async with POOL_LOCK:
+        if not force_new and conn_key in CONNECTION_POOL:
+            client = CONNECTION_POOL[conn_key]
+            if await client.check_connection():
+                logger.debug(f"Reusing existing SFTP connection: {conn_key}")
+                return client
+            else:
+                logger.warning(f"Existing connection is invalid, creating new: {conn_key}")
+                # Remove invalid connection
+                CONNECTION_POOL.pop(conn_key, None)
+    
+    # Create new client with all parameters for maximum flexibility
+    client = SFTPClient(
+        hostname=host, 
+        port=port_num, 
+        username=user, 
+        password=pwd, 
+        timeout=timeout, 
+        max_retries=max_retries, 
+        server_id=server_id,
+        sftp_host=host,
+        sftp_port=port_num,
+        sftp_username=user,
+        sftp_password=pwd
+    )
+    connected = await client.connect()
+    
+    if connected:
+        # Add to pool
+        async with POOL_LOCK:
+            CONNECTION_POOL[conn_key] = client
+            
+        return client
+    else:
+        raise ConnectionError(f"Failed to establish SFTP connection to {host}:{port_num}")
+
+class SFTPManager:
+    """Manager for SFTP connections with high-level operations
+    
+    This class wraps SFTPClient to provide a simpler interface for common operations
+    and handles proper connection management for multiple server contexts.
+    """
+    
+    def __init__(
+        self,
+        hostname: str,
+        port: int = 22,
+        username: str = None,
+        password: str = None,
+        timeout: int = 30,
+        max_retries: int = 3,
+        server_id: Optional[str] = None,
+        # Support alternative parameter naming
+        sftp_host: Optional[str] = None,
+        sftp_port: Optional[int] = None,
+        sftp_username: Optional[str] = None,
+        sftp_password: Optional[str] = None,
+    ):
+        """Initialize SFTP manager
+        
+        Args:
+            hostname: SFTP hostname (can include port as hostname:port)
+            port: SFTP port
+            username: SFTP username
+            password: SFTP password
+            timeout: Connection timeout in seconds
+            max_retries: Maximum number of connection retries
+            server_id: Server ID for tracking
+            sftp_host: Alternative parameter for hostname
+            sftp_port: Alternative parameter for port
+            sftp_username: Alternative parameter for username
+            sftp_password: Alternative parameter for password
+        """
+        # Handle combined hostname:port format
+        combined_hostname = hostname or sftp_host
+        initial_port = port or sftp_port or 22
+        
+        # Parse hostname:port format if present
+        if combined_hostname and ":" in combined_hostname:
+            hostname_parts = combined_hostname.split(":")
+            clean_hostname = hostname_parts[0]
+            if len(hostname_parts) > 1 and hostname_parts[1].isdigit():
+                extracted_port = int(hostname_parts[1])
+                logger.info(f"SFTPManager split hostname:port format: {combined_hostname} -> hostname: {clean_hostname}, port: {extracted_port}")
+                self.hostname = clean_hostname
+                self.port = extracted_port
+            else:
+                self.hostname = combined_hostname
+                self.port = initial_port
+        else:
+            self.hostname = combined_hostname
+            self.port = initial_port
+            
+        self.username = username or sftp_username
+        self.password = password or sftp_password
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.server_id = server_id
+        self.client = None
+        self.last_error = None
+        
+    async def connect(self) -> bool:
+        """Establish connection to SFTP server
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            self.client = await get_sftp_client(
+                hostname=self.hostname,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+                server_id=self.server_id
+            )
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"Failed to connect to SFTP server {self.hostname}:{self.port}: {e}")
+            return False
+            
+    async def disconnect(self) -> None:
+        """Disconnect from SFTP server"""
+        if self.client:
+            await self.client.disconnect()
+            self.client = None
+            
+    async def get_log_file(self) -> Optional[str]:
+        """Get the Deadside.log file path
+
+        Returns:
+            Optional[str]: Path to Deadside.log if found, None otherwise
+        """
+        if not self.client:
+            if not await self.connect():
+                logger.error("SFTP client is None when trying to get log file")
+                return None
+
+        try:
+            # Construct path to logs directory - format: hostname_serverid/Logs/Deadside.log
+            server_dir = f"{self.hostname.split(':')[0]}_{self.server_id}"
+            log_path = os.path.join("/", server_dir, "Logs")
+            deadside_log = os.path.join(log_path, "Deadside.log")
+            
+            # Log the exact path we're checking
+            logger.info(f"SFTPManager looking for Deadside.log at path: {deadside_log}")
+
+            # Verify file exists
+            try:
+                await self.client.stat(deadside_log)
+                logger.info(f"Found Deadside.log at: {deadside_log}")
+                return deadside_log
+            except Exception as e:
+                logger.warning(f"Deadside.log not found in {log_path}: {e}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Failed to get log file: {e}")
+            return None
+    
+    async def list_files(self, directory: str = "/logs", pattern: str = r".*\.csv") -> List[str]:
+        """List files in directory matching pattern
+        
+        Args:
+            directory: Directory to list files from
+            pattern: Regex pattern to match files against
+            
+        Returns:
+            List[str]: List of matching file paths (empty list if error)
+        """
+        # Validate inputs
+        if directory is None:
+            logger.warning("Directory parameter is None in list_files")
+            directory = "/logs"
+            
+        # Ensure client is connected
+        if not self.client:
+            logger.info(f"Creating new SFTP client connection for list_files({directory})")
+            if not await self.connect():
+                logger.error(f"Failed to establish SFTP connection for list_files({directory})")
+                return []
+                
+        # Retry logic for better reliability
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Use find_files_by_pattern which already has proper error handling
+                files = await self.client.find_files_by_pattern(directory, pattern)
+                
+                # Always return a list, even if files is None
+                return files if files is not None else []
+                
+            except Exception as e:
+                self.last_error = str(e)
+                logger.error(f"Error listing files in {directory} (attempt {attempt}/{max_attempts}): {e}")
+                
+                # If this isn't the last attempt, try reconnecting
+                if attempt < max_attempts:
+                    logger.info(f"Attempting to reconnect for list_files retry ({attempt}/{max_attempts})")
+                    await self.disconnect()
+                    await asyncio.sleep(1)  # Brief delay before retry
+                    await self.connect()
+        
+        # If we get here, all attempts failed
+        logger.warning(f"All attempts to list files in {directory} failed")
+        return []
+            
+    async def read_file(self, path: str) -> Optional[List[str]]:
+        """Read file contents
+        
+        Args:
+            path: File path to read
+            
+        Returns:
+            Optional[List[str]]: File contents as list of lines or None if error
+        """
+        if not self.client:
+            if not await self.connect():
+                logger.error(f"SFTP client is None when trying to read file {path}")
+                return None
+                
+        try:
+            return await self.client.read_file(path)
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"Error reading file {path}: {e}")
+            return None
+            
+    async def find_csv_files(self, directory: str = "/logs", 
+                             date_range: Optional[Tuple[datetime, datetime]] = None) -> List[str]:
+        """Find CSV files in directory with enhanced error handling
+        
+        Args:
+            directory: Directory to search
+            date_range: Optional date range for filtering files
+            
+        Returns:
+            List[str]: List of CSV file paths sorted by date
+        """
+        # Validate inputs
+        if directory is None:
+            logger.warning("Directory parameter is None in find_csv_files")
+            directory = "/logs"
+            
+        # Ensure client is connected
+        if not self.client:
+            logger.info(f"Creating new SFTP client connection for find_csv_files({directory})")
+            if not await self.connect():
+                logger.error(f"Failed to establish SFTP connection for find_csv_files({directory})")
+                return []
+                
+        # Retry logic for better reliability
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Call the client's find_csv_files method
+                files = await self.client.find_csv_files(directory, date_range)
+                
+                # Handle None results safely
+                if files is None:
+                    logger.warning(f"find_csv_files returned None for {directory}")
+                    return []
+                    
+                # Log success
+                logger.info(f"Found {len(files)} CSV files in {directory}")
+                return files
+                
+            except Exception as e:
+                self.last_error = str(e)
+                logger.error(f"Error finding CSV files in {directory} (attempt {attempt}/{max_attempts}): {e}")
+                
+                # If this isn't the last attempt, try reconnecting
+                if attempt < max_attempts:
+                    logger.info(f"Attempting to reconnect for find_csv_files retry ({attempt}/{max_attempts})")
+                    await self.disconnect()
+                    await asyncio.sleep(1)  # Brief delay before retry
+                    await self.connect()
+        
+        # If we get here, all attempts failed
+        logger.warning(f"All attempts to find CSV files in {directory} failed")
+        return []
+            
+    async def read_csv_lines(self, path: str) -> List[str]:
+        """Read CSV file lines with enhanced error handling and retries
+        
+        Args:
+            path: File path to read
+            
+        Returns:
+            List[str]: CSV file lines
+        """
+        # Validate input
+        if path is None or not path:
+            logger.error("Path parameter is None or empty in read_csv_lines")
+            return []
+            
+        # Ensure client is connected
+        if not self.client:
+            logger.info(f"Creating new SFTP client connection for read_csv_lines({path})")
+            if not await self.connect():
+                logger.error(f"Failed to establish SFTP connection for read_csv_lines({path})")
+                return []
+                
+        # Retry logic for better reliability
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Call the client's read_csv_lines method
+                lines = await self.client.read_csv_lines(path)
+                
+                # Handle None results safely
+                if lines is None:
+                    logger.warning(f"read_csv_lines returned None for {path}")
+                    return []
+                    
+                # Log success
+                logger.info(f"Read {len(lines)} lines from CSV file {path}")
+                return lines
+                
+            except Exception as e:
+                self.last_error = str(e)
+                logger.error(f"Error reading CSV file {path} (attempt {attempt}/{max_attempts}): {e}")
+                
+                # If this isn't the last attempt, try reconnecting
+                if attempt < max_attempts:
+                    logger.info(f"Attempting to reconnect for read_csv_lines retry ({attempt}/{max_attempts})")
+                    await self.disconnect()
+                    await asyncio.sleep(1)  # Brief delay before retry
+                    await self.connect()
+        
+        # If we get here, all attempts failed
+        logger.warning(f"All attempts to read CSV file {path} failed")
+        return []
+            
+    async def get_file_stats(self, path: str) -> Optional[Any]:
+        """Get file statistics
+        
+        Args:
+            path: File path to get stats for
+            
+        Returns:
+            Optional[Any]: File stats object or None if error
+        """
+        if not self.client:
+            if not await self.connect():
+                logger.error(f"SFTP client is None when trying to get file stats for {path}")
+                return None
+                
+        try:
+            # Get file info
+            file_info = await self.client.get_file_info(path)
+            
+            # If file_info is None, return None
+            if file_info is None:
+                logger.warning(f"No file info returned for {path}")
+                return None
+                
+            # If file_info is a dict, ensure it has st_mtime key
+            if isinstance(file_info, dict):
+                # Add st_mtime if it doesn't exist but mtime does
+                if 'st_mtime' not in file_info and 'mtime' in file_info:
+                    # Handle both datetime and timestamp formats
+                    if isinstance(file_info['mtime'], datetime):
+                        file_info['st_mtime'] = file_info['mtime'].timestamp()
+                    else:
+                        file_info['st_mtime'] = file_info['mtime']
+                
+                # Create a simple object to mimic os.stat_result
+                class StatResult:
+                    pass
+                
+                result = StatResult()
+                for key, value in file_info.items():
+                    setattr(result, key, value)
+                
+                return result
+            
+            # Return the original result if it's not a dict
+            return file_info
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"Error getting file stats for {path}: {e}")
+            return None
+            
+    async def download_file(self, path: str) -> Optional[bytes]:
+        """Download file contents with enhanced error handling and retries
+        
+        Args:
+            path: File path to download
+            
+        Returns:
+            Optional[bytes]: File contents as bytes or None if error
+        """
+        # Validate input
+        if path is None or not path:
+            logger.error("Path parameter is None or empty in download_file")
+            return None
+            
+        # Ensure client is connected
+        if not self.client:
+            logger.info(f"Creating new SFTP client connection for download_file({path})")
+            if not await self.connect():
+                logger.error(f"Failed to establish SFTP connection for download_file({path})")
+                return None
+                
+        # Retry logic for better reliability
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Call the client's download_file method
+                data = await self.client.download_file(path)
+                
+                # Handle None results safely
+                if data is None:
+                    logger.warning(f"download_file returned None for {path}")
+                    return None
+                    
+                # Log success
+                logger.info(f"Downloaded {len(data)} bytes from file {path}")
+                return data
+                
+            except Exception as e:
+                self.last_error = str(e)
+                logger.error(f"Error downloading file {path} (attempt {attempt}/{max_attempts}): {e}")
+                
+                # If this isn't the last attempt, try reconnecting
+                if attempt < max_attempts:
+                    logger.info(f"Attempting to reconnect for download_file retry ({attempt}/{max_attempts})")
+                    await self.disconnect()
+                    await asyncio.sleep(1)  # Brief delay before retry
+                    await self.connect()
+        
+        # If we get here, all attempts failed
+        logger.warning(f"All attempts to download file {path} failed")
+        return None
+
+class SFTPClient:
+    """SFTP client for game servers
+    
+    Features:
+    - Robust error handling with retries and timeouts
+    - Connection pooling for efficient resource usage
+    - Operation tracking to prevent conflicts
+    - Automatic reconnection
+    - Detailed error diagnostics
+    """
+
+    def __init__(
+        self,
+        hostname: Optional[str] = None,
+        port: Optional[int] = None,
+        username: Optional[str] = None,
+        password: Optional[str] = None,
+        timeout: int = 30,
+        max_retries: int = 3,
+        server_id: Optional[str] = None,
+        # Support for alternative parameter naming for backward compatibility
+        sftp_host: Optional[str] = None,
+        sftp_port: Optional[int] = None,
+        sftp_username: Optional[str] = None,
+        sftp_password: Optional[str] = None,
+        **kwargs  # Accept additional parameters for flexibility
+    ):
+        """Initialize SFTP handler with flexible parameter naming
+
+        Args:
+            hostname: SFTP hostname (primary parameter)
+            port: SFTP port (primary parameter)
+            username: SFTP username (primary parameter)
+            password: SFTP password (primary parameter)
+            timeout: Connection timeout in seconds
+            max_retries: Maximum number of connection retries
+            server_id: Server ID for multi-server tracking
+            sftp_host: Alternative parameter for hostname (for backward compatibility)
+            sftp_port: Alternative parameter for port (for backward compatibility)
+            sftp_username: Alternative parameter for username (for backward compatibility)
+            sftp_password: Alternative parameter for password (for backward compatibility)
+            **kwargs: Additional parameters for future extensibility
+        """
+        # Handle alternative parameter naming conventions (backward compatibility)
+        combined_hostname = hostname or sftp_host or kwargs.get('host')
+        initial_port = port or sftp_port or kwargs.get('port') or 22
+        
+        # If hostname has port embedded as hostname:port, extract it
+        if combined_hostname and ":" in combined_hostname:
+            hostname_parts = combined_hostname.split(":")
+            clean_hostname = hostname_parts[0]  # Extract just the hostname part
+            if len(hostname_parts) > 1 and hostname_parts[1].isdigit():
+                extracted_port = int(hostname_parts[1])  # Use the port from the combined string
+                logger.info(f"Split hostname:port format: {combined_hostname} -> hostname: {clean_hostname}, port: {extracted_port}")
+                self.hostname = clean_hostname
+                self.port = extracted_port
+            else:
+                self.hostname = combined_hostname
+                self.port = initial_port
+        else:
+            self.hostname = combined_hostname
+            self.port = initial_port
+            
+        self.username = username or sftp_username or kwargs.get('user')
+        self.password = password or sftp_password or kwargs.get('pwd')
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self._sftp_client = None
+        self._ssh_client = None
+        self._connected = False
+        self._connection_attempts = 0
+        self.server_id = str(server_id) if server_id is not None else None
+        self.last_error = None
+        self.last_operation = None
+        self.connection_id = f"{self.hostname}:{self.port}:{self.username}:{self.server_id}"
+        
+        # For better debugging
+        self.host = hostname  # Alias for compatibility
+        self.operation_count = 0
+        self.last_activity = datetime.now()
+
+    async def check_connection(self) -> bool:
+        """Check if the connection is still valid by attempting a simple operation.
+        
+        Returns:
+            bool: True if connection is valid, False otherwise
+        """
+        if not self._connected or not self._sftp_client:
+            return False
+            
+        try:
+            # Simple non-invasive check - try to get current directory
+            async with asyncio.timeout(5.0):  # 5 second timeout for check
+                try:
+                    await self._sftp_client.getcwd()
+                    self.last_activity = datetime.now()
+                    return True
+                except Exception:
+                    pass
+                    
+            # Try a secondary check by listing a directory
+            async with asyncio.timeout(5.0):
+                try:
+                    await self._sftp_client.listdir(".")
+                    self.last_activity = datetime.now()
+                    return True
+                except Exception:
+                    logger.warning(f"Connection to {self.connection_id} appears stale, will reconnect")
+                    await self.disconnect()
+                    return False
+                    
+        except asyncio.TimeoutError:
+            logger.warning(f"Connection check to {self.connection_id} timed out")
+            await self.disconnect()
+            return False
+        except Exception as e:
+            logger.warning(f"Connection check failed: {e}")
+            await self.disconnect()
+            return False
+
+    @retryable(max_retries=2, delay=1.0, backoff=2.0, 
+               exceptions=(asyncio.TimeoutError, ConnectionError, OSError))
+    async def connect(self) -> bool:
+        """Connect to SFTP server with retries and exponential backoff
+        
+        This method will attempt to establish a connection up to max_retries times
+        with an exponential backoff delay between attempts.
+
+        Returns:
+            True if connected successfully, False otherwise
+        """
+        # If we already have a working connection, use it
+        if self._connected and self._sftp_client and await self.check_connection():
+            return True
+            
+        # Track details for diagnostic purposes
+        start_time = datetime.now()
+        self.last_operation = "connect"
+        self.last_error = None
+        self._connection_attempts += 1
+        
+        # Add jitter to prevent connection stampedes
+        jitter = random.uniform(0, 0.5) * self._connection_attempts
+        
+        # Prevent too many rapid connection attempts
+        if self._connection_attempts > 5:
+            logger.warning(f"Too many connection attempts for {self.connection_id}, throttling")
+            # Reset and throttle to prevent resource exhaustion
+            await asyncio.sleep(30)
+            self._connection_attempts = 1
+        
+        try:
+            # Check required credentials and validate hostname
+            if not self.hostname or not self.username:
+                logger.error(f"Missing required SFTP credentials for {self.server_id}")
+                return False
+                
+            # Early exit for obviously invalid test/example hostnames
+            if '.example.' in self.hostname or self.hostname == 'localhost':
+                logger.warning(f"Invalid hostname detected for {self.server_id}: {self.hostname}")
+                return False
+                
+            logger.info(f"Connecting to SFTP server: {self.hostname}:{self.port} (attempt {self._connection_attempts})")
+            
+            # Use asyncio timeout for more reliable timeouts
+            async with asyncio.timeout(self.timeout):
+                # Create asyncssh connection
+                self._ssh_client = await asyncssh.connect(
+                    host=self.hostname,
+                    port=self.port,
+                    username=self.username,
+                    password=self.password,
+                    known_hosts=None,  # Disable known hosts check
+                    connect_timeout=self.timeout
+                )
+
+                # Get SFTP client
+                self._sftp_client = await self._ssh_client.start_sftp_client()
+
+            self._connected = True
+            self._connection_attempts = 0
+            self.last_activity = datetime.now()
+            elapsed = (datetime.now() - start_time).total_seconds()
+            
+            logger.info(f"Connected to SFTP server: {self.connection_id} in {elapsed:.2f}s")
+            return True
+
+        except (asyncio.TimeoutError, ConnectionRefusedError, asyncssh.DisconnectError) as e:
+            self._connected = False
+            self.last_error = f"{type(e).__name__}: {str(e)}"
+            
+            # If authentication failed, don't retry to avoid account lockout
+            if "Auth failed" in str(e) or "Permission denied" in str(e):
+                logger.error(f"Authentication failed for {self.connection_id}, will not retry to avoid lockout")
+                self._connection_attempts = self.max_retries + 1  # Exceed max retries to prevent further attempts
+                return False
+                
+            logger.error(f"Failed to connect to SFTP server {self.connection_id}: {self.last_error}")
+            
+            # If we've exceeded max attempts, don't raise (stops retries) 
+            if self._connection_attempts >= self.max_retries:
+                return False
+                
+            # Otherwise propagate for retry
+            raise
+            
+        except Exception as e:
+            self._connected = False
+            self.last_error = f"{type(e).__name__}: {str(e)}"
+            
+            # Log with full stack trace for debugging
+            logger.error(f"Failed to connect to SFTP server {self.connection_id}: {e}")
+            
+            # Check if we need to retry or give up
+            if self._connection_attempts >= self.max_retries:
+                logger.warning(f"Maximum connection attempts ({self.max_retries}) reached for {self.connection_id}. Giving up.")
+                return False
+                
+            # Add delay with jitter before retry to prevent thundering herd
+            delay = min(10, (2 ** self._connection_attempts) + jitter)
+            logger.info(f"Will retry connection to {self.connection_id} in {delay:.2f} seconds...")
+            
+            # Convert to a connection error for retry handling by decorator
+            raise ConnectionError(f"SFTP connection failed: {str(e)}")
+
+    async def disconnect(self):
+        """Disconnect from SFTP server and clean up resources"""
+        # Clean up connection pool if this client is in it
+        if hasattr(self, 'connection_id'):
+            async with POOL_LOCK:
+                if self.connection_id in CONNECTION_POOL:
+                    if CONNECTION_POOL[self.connection_id] is self:
+                        logger.info(f"Removing {self.connection_id} from connection pool")
+                        CONNECTION_POOL.pop(self.connection_id, None)
+
+        # Clean up active operations tracking
+        if hasattr(self, 'server_id') and self.server_id:
+            if self.server_id in ACTIVE_OPERATIONS:
+                logger.info(f"Clearing {len(ACTIVE_OPERATIONS[self.server_id])} active operations for {self.server_id}")
+                ACTIVE_OPERATIONS.pop(self.server_id, None)
+
+        # Close SFTP client
+        if self._sftp_client:
+            try:
+                # The SFTP client will be closed when the SSH client is closed
+                # but we set it to None to avoid any further operations
+                pass
+            except Exception as e:
+                logger.warning(f"Error handling SFTP client: {e}")
+            self._sftp_client = None
+
+        # Close SSH client
+        if self._ssh_client:
+            try:
+                self._ssh_client.close()
+            except Exception as e:
+                logger.warning(f"Error closing SSH client: {e}")
+            self._ssh_client = None
+
+        self._connected = False
+        logger.info(f"Disconnected from SFTP server: {self.connection_id}")
+
+    @retryable(max_retries=1, delay=1.0, backoff=1.5, 
+               exceptions=(asyncio.TimeoutError, ConnectionError, OSError))
+    async def ensure_connected(self):
+        """Ensure connection to SFTP server with proper error handling
+        
+        This will check the connection, reconnect if necessary, and retry on failure.
+        Note: Reduced retries to prevent excessive resource consumption.
+        """
+        try:
+            # Fast path - already connected
+            if self._connected and self._sftp_client and self._ssh_client:
+                # Check if connection is still valid (quick check)
+                if await self.check_connection():
+                    return
+            
+            # If we've had multiple failures recently, don't keep retrying
+            # This prevents the bot from wasting resources on failing connections
+            if self._connection_attempts > 3:
+                logger.warning(f"Too many recent connection attempts for {self.connection_id}, backing off")
+                # Don't raise an exception, just return and let the caller handle a null connection
+                self.last_error = "Too many recent connection attempts, backing off"
+                return
+                    
+            # Need to connect or reconnect
+            connected = await self.connect()
+            
+            # Verify connection was successful
+            if not connected or not self._connected:
+                logger.warning(f"Failed to establish SFTP connection for {self.connection_id}")
+                # Don't raise, just return and let caller handle missing connection
+                return
+                
+        except (asyncio.TimeoutError, ConnectionRefusedError) as e:
+            # If we get a connection timeout or refusal, don't keep retrying
+            # This is likely a server issue that won't resolve quickly
+            logger.error(f"Connection refused or timed out for {self.connection_id}: {e}")
+            self.last_error = f"Connection refused: {str(e)}"
+            # Don't raise to prevent needless retries
+            
+        except (ConnectionError, OSError) as e:
+            # Other connection errors might be temporary
+            logger.error(f"Connection error in ensure_connected: {e}")
+            # Let the retry decorator handle this
+            raise
+            
+        except Exception as e:
+            logger.error(f"Unexpected error in ensure_connected: {e}")
+            self.last_error = f"Connection error: {str(e)}"
+            # Don't raise to prevent bot crashes on connection errors
+            # The caller will handle the missing connection
+
+    async def list_directory(self, directory: str) -> List[str]:
+        """List files in directory
+
+        Args:
+            directory: Directory to list
+
+        Returns:
+            List of filenames
+        """
+        await self.ensure_connected()
+
+        try:
+            if self._sftp_client is not None:
+                entries = await self._sftp_client.listdir(directory)
+                self.last_activity = datetime.now()  # Update last activity timestamp
+                self.operation_count += 1
+                return entries
+            else:
+                logger.error(f"SFTP client is None when trying to list directory {directory}")
+                return []
+        except Exception as e:
+            logger.error(f"Failed to list directory {directory}: {e}")
+            return []
+
+    async def get_file_info(self, path: str) -> Optional[Dict[str, Any]]:
+        """Get file information
+
+        Args:
+            path: File path
+
+        Returns:
+            File information or None if not found
+        """
+        await self.ensure_connected()
+
+        try:
+            if self._sftp_client is not None:
+                stat = await self._sftp_client.stat(path)
+                self.last_activity = datetime.now()  # Update last activity timestamp
+                self.operation_count += 1
+                
+                # Create a stat-like object for compatibility with os.stat
+                result = {
+                    "size": stat.size,
+                    "mtime": datetime.fromtimestamp(stat.mtime),
+                    "atime": datetime.fromtimestamp(stat.atime),
+                    "is_dir": stat.type == 2,  # asyncssh.FILEXFER_TYPE_DIRECTORY = 2
+                    "is_file": stat.type == 1,  # asyncssh.FILEXFER_TYPE_REGULAR = 1
+                    "permissions": stat.permissions,
+                    # Add standard os.stat attributes for compatibility
+                    "st_mtime": stat.mtime,
+                    "st_size": stat.size,
+                    "st_atime": stat.atime,
+                    "st_mode": stat.permissions if hasattr(stat, 'permissions') else 0
+                }
+                return result
+            else:
+                logger.error(f"SFTP client is None when trying to get file info for {path}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to get file info for {path}: {e}")
+            return None
+
+    async def download_file(self, remote_path: str, local_path: Optional[str] = None) -> Optional[bytes]:
+        """Download file from SFTP server
+
+        Args:
+            remote_path: Remote file path
+            local_path: Optional local file path to save to
+
+        Returns:
+            File contents as bytes if local_path is not provided, otherwise None
+        """
+        await self.ensure_connected()
+
+        try:
+            if self._sftp_client is None:
+                logger.error(f"SFTP client is None when trying to download file {remote_path}")
+                return None
+                
+            # Update last activity timestamp before operation
+            self.last_activity = datetime.now()
+            self.operation_count += 1
+            
+            if local_path:
+                # Download to file
+                await self._sftp_client.get(remote_path, local_path)
+                # Update again after successful operation
+                self.last_activity = datetime.now()
+                logger.info(f"Downloaded {remote_path} to {local_path}")
+                return None
+            else:
+                # Download to memory
+                file_obj = io.BytesIO()
+                await self._sftp_client.getfo(remote_path, file_obj)
+                # Update again after successful operation
+                self.last_activity = datetime.now()
+
+                # Reset position to beginning
+                file_obj.seek(0)
+                content = file_obj.read()
+
+                logger.info(f"Downloaded {remote_path} to memory ({len(content)} bytes)")
+                return content
+
+        except Exception as e:
+            logger.error(f"Failed to download file {remote_path}: {e}")
+            return None
+
+    async def read_file_by_chunks(self, remote_path: str, chunk_size: int = 4096) -> Optional[List[bytes]]:
+        """Read file by chunks
+
+        Args:
+            remote_path: Remote file path
+            chunk_size: Chunk size in bytes
+
+        Returns:
+            List of chunks or None if failed
+        """
+        await self.ensure_connected()
+
+        try:
+            if self._sftp_client is None:
+                logger.error(f"SFTP client is None when trying to read file {remote_path} by chunks")
+                return None
+                
+            chunks = []
+            async with self._sftp_client.open(remote_path, 'rb') as f:
+                while True:
+                    chunk = await f.read(chunk_size)
+                    if chunk is None:
+                        break
+                    chunks.append(chunk)
+
+            logger.info(f"Read {remote_path} by chunks ({len(chunks)} chunks)")
+            return chunks
+
+        except Exception as e:
+            logger.error(f"Failed to read file {remote_path} by chunks: {e}")
+            return None
+            
+    async def read_file(self, remote_path: str, start_line: int = 0, max_lines: int = -1) -> Optional[List[str]]:
+        """Read file from remote server with line control
+        
+        This method is specifically designed for the historical parse functionality,
+        allowing reading a specific number of lines starting from a given position.
+        
+        Args:
+            remote_path: Remote file path
+            start_line: Line number to start reading from (0-indexed)
+            max_lines: Maximum number of lines to read (-1 for all lines)
+            
+        Returns:
+            List of text lines or None on error
+        """
+        await self.ensure_connected()
+        
+        try:
+            # Download file content to memory
+            content_data = await self.download_file(remote_path)
+            if content_data is None:
+                logger.error(f"Could not download file content for {remote_path}")
+                return None
+                
+            # Split into lines and apply start/max limits
+            all_lines = content_data.decode('utf-8', errors='replace').splitlines()
+            
+            # Calculate end based on start and max_lines
+            end_line = len(all_lines) if max_lines < 0 else min(start_line + max_lines, len(all_lines))
+            
+            # Get the requested lines
+            requested_lines = all_lines[start_line:end_line]
+            
+            logger.debug(f"Read {len(requested_lines)} lines from {remote_path} (start={start_line}, max={max_lines})")
+            return requested_lines
+            
+        except Exception as e:
+            logger.error(f"Failed to read file {remote_path}: {e}")
+            traceback.print_exc()
+            return None
+
+    @with_operation_tracking("find_files")
+    async def list_files(self, directory: str, pattern: str = r".*\.csv") -> List[str]:
+        """List files in directory matching pattern (alias for find_files_by_pattern)
+        
+        This is a compatibility method to match SFTPManager's interface.
+        
+        Args:
+            directory: Directory to list files from
+            pattern: Regex pattern to match files against
+            
+        Returns:
+            List[str]: List of matching file paths
+        """
+        return await self.find_files_by_pattern(directory, pattern)
+        
+    @with_operation_tracking("find_files")
+    async def find_files_by_pattern(self, directory: str, pattern: str, recursive: bool = False, max_depth: int = 5) -> List[str]:
+        """Find files by pattern
+
+        Args:
+            directory: Directory to search
+            pattern: Regular expression pattern for filenames
+            recursive: Whether to search recursively
+            max_depth: Maximum recursion depth
+
+        Returns:
+            List of matching file paths (empty list if error occurs)
+        """
+        await self.ensure_connected()
+        
+        # Check if we're connected after trying to ensure connection
+        if not self._connected or self._sftp_client is None:
+            logger.warning(f"Not connected to SFTP server when trying to find files in {directory}")
+            return []
+            
+        try:
+            result = []
+            pattern_re = re.compile(pattern)
+
+            await self._find_files_recursive(directory, pattern_re, result, recursive, max_depth, 0)
+
+            return result
+        except Exception as e:
+            logger.error(f"Error in find_files_by_pattern: {str(e)}")
+            return []
+
+    async def get_log_file(self) -> Optional[str]:
+        """Get the Deadside.log file path
+
+        Returns:
+            Optional[str]: Path to Deadside.log if found, None otherwise
+        """
+        await self.ensure_connected()
+
+        try:
+            # Construct path to logs directory - format: hostname_serverid/Logs/Deadside.log
+            server_dir = f"{self.hostname.split(':')[0]}_{self.server_id}"
+            log_path = os.path.join("/", server_dir, "Logs")
+            deadside_log = os.path.join(log_path, "Deadside.log")
+            
+            # Log the exact path we're checking
+            logger.info(f"Looking for Deadside.log at path: {deadside_log}")
+
+            # Verify file exists and log the path we're checking
+            try:
+                logger.info(f"Checking for Deadside.log at path: {deadside_log}")
+                if self._sftp_client is None:
+                    logger.error(f"SFTP client is None when trying to check for Deadside.log")
+                    return None
+                    
+                await self._sftp_client.stat(deadside_log)
+                logger.info(f"Found Deadside.log at: {deadside_log}")
+                return deadside_log
+            except Exception as e:
+                logger.warning(f"Deadside.log not found in {log_path}: {e}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Failed to get log file: {e}")
+            return None
+
+    async def _find_files_recursive(self, directory: str, pattern_re: re.Pattern, result: List[str], recursive: bool, max_depth: int, current_depth: int):
+        """Recursively find files by pattern
+
+        Args:
+            directory: Directory to search
+            pattern_re: Compiled regular expression pattern
+            result: List to add results to
+            recursive: Whether to search recursively
+            max_depth: Maximum recursion depth
+            current_depth: Current recursion depth
+        """
+        if current_depth > max_depth:
+            logger.debug(f"Max depth {max_depth} reached, stopping at directory: {directory}")
+            return
+
+        # Safety check - make sure result is a list
+        if result is None:
+            logger.warning("Result list was None in _find_files_recursive, creating new list")
+            result = []
+            
+        try:
+            # Normalize directory paths with trailing slashes to ensure consistent path joining
+            if not directory.endswith('/'):
+                directory = directory + '/'
+                
+            logger.debug(f"Scanning directory: {directory} (depth {current_depth}/{max_depth})")
+            
+            # Verify connection before proceeding
+            if not self._connected or self._sftp_client is None:
+                logger.error(f"Not connected to SFTP server when trying to list directory {directory}")
+                return
+                
+            # List directory contents
+            try:
+                entries = await self._sftp_client.listdir(directory)
+                logger.debug(f"Found {len(entries)} entries in {directory}")
+            except Exception as list_err:
+                logger.error(f"Failed to list directory {directory}: {list_err}")
+                return
+                
+            # Process all entries
+            for entry in entries:
+                # Avoid . and .. entries that could cause loops
+                if entry in ('.', '..'):
+                    continue
+                    
+                # Build full path properly
+                entry_path = f"{directory}{entry}"
+                
+                try:
+                    # Get file info with proper error handling
+                    entry_info = await self.get_file_info(entry_path)
+                    
+                    if entry_info is None:
+                        logger.warning(f"Could not get info for: {entry_path}")
+                        continue
+
+                    # Check if it's a CSV file
+                    if entry_info["is_file"] and pattern_re.search(entry):
+                        logger.debug(f"Found matching file: {entry_path}")
+                        result.append(entry_path)
+
+                    # Recursively explore directories if needed
+                    elif entry_info["is_dir"] and recursive:
+                        logger.debug(f"Exploring subdirectory: {entry_path}")
+                        await self._find_files_recursive(entry_path, pattern_re, result, recursive, max_depth, current_depth + 1)
+
+                except Exception as e:
+                    logger.warning(f"Error processing entry {entry_path}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Failed to process directory {directory}: {e}")
+            logger.debug(f"Directory error details:\n{traceback.format_exc()}")
+
+    @with_operation_tracking("find_csv")
+    @retryable(max_retries=2, delay=1.0, backoff=1.5, 
+               exceptions=(asyncio.TimeoutError, ConnectionError, OSError))
+    async def find_csv_files(
+        self, 
+        directory: str, 
+        date_range: Optional[Tuple[datetime, datetime]] = None,
+        recursive: bool = True,
+        max_depth: int = 5,
+        include_hourly: bool = True,
+        timeout: Optional[float] = 60.0
+    ) -> List[str]:
+        """Find CSV files in directory with enhanced error handling and date filtering
+        
+        This method finds CSV files in the specified directory, with support for:
+        - Date range filtering based on filename patterns
+        - Recursive directory traversal with depth limiting
+        - Operation timeout to prevent hanging
+        - Automatic retries on connection errors
+        - Detailed error reporting
+
+        Args:
+            directory: Directory to search
+            date_range: Optional tuple of (start_date, end_date) to filter by filename date
+            recursive: Whether to search recursively
+            max_depth: Maximum recursion depth
+            include_hourly: Whether to include hourly CSV files (those with HH.MM.SS in name)
+            timeout: Operation timeout in seconds (None for no timeout)
+
+        Returns:
+            List of CSV file paths sorted by date (newest first if date_range is provided)
+        """
+        start_time = datetime.now()
+        self.last_operation = f"find_csv_files({directory})"
+        self.last_error = None
+        self.operation_count += 1
+        
+        # Normalize directory path
+        if directory is None or directory == ".":
+            directory = await self._get_current_directory()
+        
+        logger.info(f"Searching for CSV files in {directory} (recursive={recursive}, max_depth={max_depth})")
+        
+        try:
+            # Use timeout to prevent hanging
+            if timeout:
+                async with asyncio.timeout(timeout):
+                    return await self._find_csv_files_impl(
+                        directory, date_range, recursive, max_depth, include_hourly
+                    )
+            else:
+                return await self._find_csv_files_impl(
+                    directory, date_range, recursive, max_depth, include_hourly
+                )
+                
+        except asyncio.TimeoutError:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            self.last_error = f"Operation timed out after {elapsed:.1f}s"
+            logger.error(f"CSV file search in {directory} timed out after {elapsed:.1f}s")
+            raise
+            
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            self.last_error = f"{type(e).__name__}: {str(e)}"
+            logger.error(f"Error searching for CSV files in {directory}: {e} (after {elapsed:.1f}s)")
+            
+            # Convert to retryable error types
+            if isinstance(e, (OSError, IOError, ConnectionError, asyncio.TimeoutError)):
+                raise  # Let retry decorator handle these types directly
+            else:
+                # Wrap in ConnectionError for retry handling
+                raise ConnectionError(f"SFTP operation failed: {str(e)}")
+    
+    async def _get_current_directory(self) -> str:
+        """Get current directory on SFTP server"""
+        await self.ensure_connected()
+        try:
+            if self._sftp_client is None:
+                logger.error("SFTP client is None when trying to get current directory")
+                return "."
+                
+            return await self._sftp_client.getcwd() or "."
+        except Exception as e:
+            logger.warning(f"Failed to get current directory: {e}")
+            return "."
+    
+    async def _find_csv_files_impl(
+        self,
+        directory: str,
+        date_range: Optional[Tuple[datetime, datetime]] = None,
+        recursive: bool = True,
+        max_depth: int = 5,
+        include_hourly: bool = True
+    ) -> List[str]:
+        """Implementation of CSV file search with date filtering"""
+        # Ensure we're connected before searching
+        await self.ensure_connected()
+        
+        # Find all CSV files
+        csv_files = await self.find_files_by_pattern(directory, r'\.csv$', recursive, max_depth)
+        logger.info(f"Found {len(csv_files)} CSV files in {directory}")
+        
+        # Return early if no files found
+        if not csv_files:
+            return []
+            
+        # Return all files if no date range
+        if date_range is None:
+            return sorted(csv_files)
+            
+        # Parse start and end dates
+        start_date, end_date = date_range
+        filtered_files = []
+        file_dates = {}  # Store dates for sorting
+        
+        # Date format patterns to try
+        date_patterns = [
+            # Standard date formats
+            (r'(\d{4}[.-]\d{2}[.-]\d{2})', ['%Y-%m-%d', '%Y.%m.%d']),
+            
+            # Date with time formats
+            (r'(\d{4}[.-]\d{2}[.-]\d{2}[.-]\d{2}[.-]\d{2}[.-]\d{2})', ['%Y-%m-%d-%H-%M-%S', '%Y.%m.%d.%H.%M.%S']),
+            (r'(\d{4}[.-]\d{2}[.-]\d{2})[^0-9](\d{2})[^0-9](\d{2})[^0-9](\d{2})', 
+             ['combined:%Y-%m-%d %H:%M:%S', 'combined:%Y.%m.%d %H:%M:%S']),
+             
+            # Fallback pattern with just year-month
+            (r'(\d{4}[.-]\d{2})', ['%Y-%m', '%Y.%m'])
+        ]
+        
+        for file_path in csv_files:
+            # Extract date from filename using patterns
+            file_name = os.path.basename(file_path)
+            file_date = None
+            matched = False
+            
+            # Try all patterns until one matches
+            for pattern, formats in date_patterns:
+                date_match = re.search(pattern, file_name)
+                if date_match is None:
+                    continue
+                    
+                # Try each format for the matched pattern
+                date_str = date_match.group(1)
+                for date_format in formats:
+                    try:
+                        # Handle the special combined format case
+                        if date_format.startswith('combined:'):
+                            # Format like "2025.05.03-01.00.00" or "2025-05-03 01:00:00"
+                            actual_format = date_format.split(':', 1)[1]
+                            groups = date_match.groups()
+                            
+                            if len(groups) >= 4:
+                                # Combine date and time parts
+                                date_part = groups[0]
+                                hour = groups[1]
+                                minute = groups[2]
+                                second = groups[3]
+                                
+                                if '-' in date_part:
+                                    date_time_str = f"{date_part} {hour}:{minute}:{second}"
+                                else:
+                                    date_time_str = f"{date_part} {hour}:{minute}:{second}"
+                                    
+                                file_date = datetime.strptime(date_time_str, actual_format)
+                                matched = True
+                                break
+                        else:
+                            # Standard single-part format
+                            file_date = datetime.strptime(date_str, date_format)
+                            matched = True
+                            break
+                            
+                    except ValueError:
+                        # Try next format
+                        continue
+                        
+                if matched:
+                    break
+            
+            # If we didn't extract a date but file has "hourly" pattern, try to parse it specially
+            if not matched and not include_hourly and re.search(r'hourly|(\d{2}\.\d{2}\.\d{2})', file_name, re.IGNORECASE):
+                # Skip hourly files if requested
+                continue
+                
+            # If we extracted a date, check if it's in range
+            if file_date:
+                if start_date <= file_date <= end_date:
+                    filtered_files.append(file_path)
+                    file_dates[file_path] = file_date
+            else:
+                # If no date found or parsing failed, include the file
+                filtered_files.append(file_path)
+        
+        logger.info(f"Filtered to {len(filtered_files)} CSV files within date range {start_date} to {end_date}")
+        
+        # Sort files by date, newest first, if dates were extracted
+        if file_dates:
+            return sorted(filtered_files, key=lambda f: file_dates.get(f, datetime.min), reverse=True)
+        else:
+            # Otherwise sort by name
+            return sorted(filtered_files)
+
+    @with_operation_tracking("find_csv_recursive")
+    async def _find_csv_files_recursive(self, directory: str, max_depth: int = 5) -> List[str]:
+        """Find CSV files recursively in a directory structure
+        
+        This method is provided for backward compatibility with older code.
+        It uses the new enhanced file finding system with CSV-specific pattern matching.
+        
+        Args:
+            directory: Directory to search
+            max_depth: Maximum recursion depth
+            
+        Returns:
+            List of CSV file paths
+        """
+        logger.info(f"Finding CSV files recursively in {directory} (max_depth={max_depth})")
+        
+        # Use the new CSV file finding method with deep recursion
+        try:
+            # Use a specific pattern for Tower of Temptation CSV files
+            # Format: YYYY.MM.DD-HH.MM.SS.csv or similar variations
+            csv_files = await self.find_files_by_pattern(
+                directory, 
+                r'\d{4}[.-]\d{2}[.-]\d{2}.*\.csv$',  # Match date-formatted CSV files
+                recursive=True, 
+                max_depth=max_depth
+            )
+            
+            if not csv_files:
+                # Try a more generic pattern as fallback
+                csv_files = await self.find_files_by_pattern(
+                    directory, 
+                    r'\.csv$',  # Match any CSV file
+                    recursive=True, 
+                    max_depth=max_depth
+                )
+                
+            # Sort files by name (which should also sort by date for standard format)
+            return sorted(csv_files)
+            
+        except Exception as e:
+            logger.error(f"Error in _find_csv_files_recursive for {directory}: {e}")
+            logger.debug(f"Stack trace:\n{traceback.format_exc()}")
+            return []
+    
+    @with_operation_tracking("read_csv")
+    @retryable(max_retries=2, delay=1.0, backoff=1.5, 
+               exceptions=(asyncio.TimeoutError, ConnectionError, OSError))
+    async def read_csv_lines(
+        self, 
+        remote_path: str, 
+        encoding: str = 'utf-8',
+        timeout: Optional[float] = 30.0,
+        fallback_encodings: List[str] = ['latin-1', 'cp1252', 'iso-8859-1']
+    ) -> List[str]:
+        """Read CSV file lines with robust error handling and encoding detection
+        
+        Features:
+        - Automatic retries for network errors
+        - Multiple encoding fallbacks
+        - Timeout protection
+        - Operation tracking
+        - Detailed error reporting
+        
+        Args:
+            remote_path: Remote file path
+            encoding: Primary file encoding to try
+            timeout: Operation timeout in seconds (None for no timeout)
+            fallback_encodings: List of encodings to try if primary encoding fails
+
+        Returns:
+            List of lines from the CSV file
+        """
+        start_time = datetime.now()
+        self.last_operation = f"read_csv_lines({remote_path})"
+        self.last_error = None
+        self.operation_count += 1
+        
+        logger.info(f"Reading CSV file: {remote_path} with encoding: {encoding}")
+        
+        try:
+            # Use timeout to prevent hanging
+            if timeout:
+                async with asyncio.timeout(timeout):
+                    return await self._read_csv_lines_impl(remote_path, encoding, fallback_encodings)
+            else:
+                return await self._read_csv_lines_impl(remote_path, encoding, fallback_encodings)
+                
+        except asyncio.TimeoutError:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            self.last_error = f"Operation timed out after {elapsed:.1f}s"
+            logger.error(f"Reading CSV file {remote_path} timed out after {elapsed:.1f}s")
+            raise
+            
+        except Exception as e:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            self.last_error = f"{type(e).__name__}: {str(e)}"
+            logger.error(f"Error reading CSV file {remote_path}: {e} (after {elapsed:.1f}s)")
+            
+            # Convert to retryable error types
+            if isinstance(e, (OSError, IOError, ConnectionError, asyncio.TimeoutError)):
+                raise  # Let retry decorator handle these types directly
+            else:
+                # Wrap in ConnectionError for retry handling
+                raise ConnectionError(f"SFTP operation failed: {str(e)}")
+    
+    async def _read_csv_lines_impl(
+        self, 
+        remote_path: str, 
+        encoding: str,
+        fallback_encodings: List[str]
+    ) -> List[str]:
+        """Implementation of CSV file reading with encoding fallbacks"""
+        # Download the file
+        content = await self.download_file(remote_path)
+        
+        if content is None:
+            logger.warning(f"No content downloaded from {remote_path}")
+            return []
+            
+        logger.info(f"Downloaded {len(content)} bytes from {remote_path}")
+            
+        # Try the primary encoding first
+        try:
+            text = content.decode(encoding)
+            lines = text.splitlines()
+            logger.info(f"Successfully decoded {remote_path} with {encoding}: {len(lines)} lines")
+            return lines
+        except UnicodeDecodeError:
+            logger.warning(f"Failed to decode {remote_path} with {encoding}, trying fallbacks")
+            
+        # Try fallback encodings
+        for fallback in fallback_encodings:
+            try:
+                text = content.decode(fallback)
+                lines = text.splitlines()
+                logger.info(f"Successfully decoded {remote_path} with fallback {fallback}: {len(lines)} lines")
+                return lines
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                logger.error(f"Error with fallback encoding {fallback}: {e}")
+                continue
+                
+        # Try a desperate measure - replace invalid chars
+        try:
+            text = content.decode(encoding, errors='replace')
+            lines = text.splitlines()
+            logger.warning(f"Used {encoding} with error replacement on {remote_path}: {len(lines)} lines")
+            return lines
+        except Exception as e:
+            logger.error(f"Final attempt to decode {remote_path} failed: {e}")
+            return []
+    
+    async def get_file_size(self, remote_path: str) -> Optional[int]:
+        """Get size of file in bytes
+        
+        Args:
+            remote_path: Remote file path
+            
+        Returns:
+            File size in bytes or None if error occurs
+        """
+        info = await self.get_file_info(remote_path)
+        if info and "size" in info:
+            return info["size"]
+        return None
+        
+    @with_operation_tracking("get_latest_csv")
+    @retryable(max_retries=2, delay=1.0, backoff=2.0, 
+               exceptions=(asyncio.TimeoutError, ConnectionError, OSError))
+    async def get_latest_csv_file(self) -> Optional[str]:
+        """Find the most recent CSV file across all subdirectories
+        
+        This method will recursively search for CSV files in all subdirectories
+        and return the path to the most recent one based on filename date or modification time.
+        
+        Returns:
+            Path to the most recent CSV file or None if no files found
+        """
+        await self.ensure_connected()
+        
+        if not self._connected or not self._sftp_client:
+            logger.error(f"Cannot get latest CSV file - not connected: {self.connection_id}")
+            return None
+        
+        try:
+            # Build the path to the correct directory structure: hostname_serverid/actual1/deathlogs/
+            server_dir = f"{self.hostname.split(':')[0]}_{self.server_id}"
+            csv_path = os.path.join("/", server_dir, "actual1", "deathlogs")
+            
+            logger.info(f"Searching for CSV files in specific directory: {csv_path}")
+            
+            # Find all CSV files recursively in the proper directory structure
+            csv_files = await self.find_csv_files(
+                directory=csv_path,
+                recursive=True,
+                max_depth=5,
+                include_hourly=True
+            )
+            
+            if not csv_files:
+                logger.warning(f"No CSV files found for server {self.server_id}")
+                return None
+                
+            # Sort CSV files by modification time
+            newest_file = None
+            newest_time = 0
+            
+            for file_path in csv_files:
+                try:
+                    file_info = await self.get_file_info(file_path)
+                    if file_info and 'mtime' in file_info:
+                        mtime = file_info['mtime']
+                        if mtime > newest_time:
+                            newest_time = mtime
+                            newest_file = file_path
+                except Exception as stat_e:
+                    logger.warning(f"Error getting stats for {file_path}: {stat_e}")
+            
+            if newest_file:
+                logger.info(f"Found most recent CSV file: {newest_file}")
+                return newest_file
+            else:
+                logger.warning(f"Could not determine most recent CSV file by mtime, using first from {len(csv_files)} files")
+                # Return the first one if we can't determine by date
+                return csv_files[0] 
+                
+        except Exception as e:
+            logger.error(f"Error in get_latest_csv_file: {e}")
+            return None
+
+# Add SFTPManager as alias for SFTPClient to maintain backward compatibility
+# This allows code using either class name to work properly
+# This class is intentionally removed as it's been replaced by the more robust 
+# SFTPManager class defined below. All calls to this class will now use the full-featured 
+# implementation that properly handles hostname:port format strings and has comprehensive 
+# error handling

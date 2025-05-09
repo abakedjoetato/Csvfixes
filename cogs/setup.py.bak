@@ -1,0 +1,608 @@
+"""
+Setup commands for configuring servers and channels
+"""
+import logging
+import os
+import re
+import psutil
+import discord
+from discord.ext import commands
+from discord import app_commands
+from typing import Dict, List, Any, Optional
+import asyncio
+from datetime import datetime
+
+from models.guild import Guild
+from models.server import Server
+from utils.sftp import SFTPClient
+from utils.embed_builder import EmbedBuilder
+from utils.helpers import has_admin_permission
+from utils.parsers import CSVParser
+from utils.decorators import premium_tier_required
+from utils.discord_utils import server_id_autocomplete, hybrid_send
+from config import PREMIUM_TIERS
+
+logger = logging.getLogger(__name__)
+
+class Setup(commands.Cog):
+    """Setup commands for configuring servers and channels"""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.hybrid_group(name="setup", description="Server setup commands")
+    @commands.guild_only()
+    async def setup(self, ctx):
+        """Setup command group"""
+        if ctx.invoked_subcommand is None:
+            await ctx.send("Please specify a subcommand.")
+
+    @setup.command(name="addserver", description="Add a game server to track PvP stats")
+    @app_commands.describe(
+        server_name="Friendly name to display for this server",
+        host="SFTP host address",
+        port="SFTP port",
+        username="SFTP username",
+        password="SFTP password",
+        server_id="Unique ID for the server (letters, numbers, underscores only)"
+    )
+    @app_commands.guild_only()
+    @premium_tier_required(1)  # Connecting servers requires premium tier 1+
+    async def add_server(self, ctx, server_name: str, host: str, port: int, username: str, password: str, server_id: str):
+        """Add a new server to track"""
+        try:
+            # Defer response to prevent timeout
+            await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild model for themed embed and premium checks
+            # Use get_or_create which will auto-create guild if it doesn't exist
+            try:
+                guild_model = await Guild.get_or_create(self.bot.db, str(ctx.guild.id), ctx.guild.name)
+                if guild_model is None:
+                    logger.error(f"Failed to get or create guild for {ctx.guild.id}")
+                    await hybrid_send(ctx, "Error retrieving guild information. Please try again later.")
+                    return
+
+                logger.info(f"Retrieved guild model for {ctx.guild.id} with tier {guild_model.premium_tier}")
+            except Exception as e:
+                logger.error(f"Error getting guild model with get_or_create: {e}")
+                await hybrid_send(ctx, "Error retrieving guild information. Please try again later.")
+                return
+
+            # Get guild premium tier and server count
+            guild_tier = int(guild_model.premium_tier) if guild_model.premium_tier is not None else 0
+            server_count = len(guild_model.servers) if hasattr(guild_model, 'servers') and guild_model.servers is not None else 0
+
+            # Check server limit based on premium tier
+            from config import PREMIUM_TIERS
+            max_servers = PREMIUM_TIERS.get(guild_tier, {}).get("max_servers", 1)
+            tier_name = PREMIUM_TIERS.get(guild_tier, {}).get("name", f"Tier {guild_tier}")
+
+            if server_count >= max_servers:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Limit Reached",
+                    f"Your guild is on the **{tier_name}** tier, which allows a maximum of **{max_servers}** server{'s' if max_servers != 1 else ''}.\n\n"
+                    f"To add more servers, please upgrade your premium tier with `/premium upgrade`.",
+                    guild=guild_model
+                )
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Validate server ID (no spaces, special chars except underscore)
+            if not re.match(r'^[a-zA-Z0-9_]+$', server_id):
+                embed = await EmbedBuilder.create_error_embed(
+                    "Invalid Server ID",
+                    "Server ID can only contain letters, numbers, and underscores."
+                , guild=guild_model)
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Store SFTP information
+            sftp_info = {
+                "hostname": host,  # Changed to match SFTPClient parameter name
+                "port": port,
+                "username": username,
+                "password": password
+            }
+
+            # Validate SFTP info
+            if host is None or not username or not password:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Invalid SFTP Information",
+                    "Please provide valid host, username, and password for SFTP connection."
+                , guild=guild_model)
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # We already have guild_model from earlier, so use that instead of fetching again
+            guild = guild_model
+            logger.info(f"Using existing guild model for {ctx.guild.id} with premium tier: {guild.premium_tier}")
+
+            # Check if we can add killfeed feature
+            if not guild.check_feature_access("killfeed"):
+                logger.warning(f"Guild {ctx.guild.id} does not have killfeed feature access")
+                embed = await EmbedBuilder.create_error_embed(
+                    "Feature Disabled",
+                    "This guild does not have the Killfeed feature enabled. Please contact an administrator."
+                , guild=guild_model)
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Check if server ID already exists
+            for server in guild.servers:
+                if server.get("server_id") == server_id:
+                    embed = await EmbedBuilder.create_error_embed(
+                        "Server Exists",
+                        f"A server with ID '{server_id}' already exists in this guild."
+                    , guild=guild_model)
+                    await hybrid_send(ctx, embed=embed)
+                    return
+
+            # Initial response
+            embed = await EmbedBuilder.create_base_embed(
+                "Adding Server",
+                f"Testing connection to {server_name}..."
+            , guild=guild_model)
+            message = await hybrid_send(ctx, embed=embed)
+
+            # Create SFTP client to test connection
+            sftp_client = SFTPClient(
+                hostname=sftp_info["hostname"],  # Updated to match key in sftp_info dictionary
+                port=sftp_info["port"],
+                username=sftp_info["username"],
+                password=sftp_info["password"],
+                server_id=server_id
+            )
+
+            # Test connection
+            connected = await sftp_client.connect()
+            if not connected:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Connection Failed",
+                    f"Failed to connect to SFTP server: {sftp_client.last_error}"
+                , guild=guild_model)
+                await message.edit(embed=embed)
+                return
+
+            # Connection successful - skip CSV file check
+            # The historical parser will find CSV files on its own
+            # This eliminates redundant SFTP operations and reduces connection time
+            logger.info(f"SFTP connection successful for server {server_id}. Skipping redundant CSV file check.")
+            csv_files = []  # Empty placeholder since we don't need to check
+
+            # Check if we can find log file
+            embed = await EmbedBuilder.create_base_embed(
+                "Adding Server",
+                f"Connection successful. Looking for log file..."
+            , guild=guild_model)
+            await message.edit(embed=embed)
+
+            log_file = await sftp_client.get_log_file()
+            log_found = log_file is not None
+
+            # Create proper Server object first
+            server = await Server.create_server(
+                self.bot.db,
+                str(ctx.guild.id),
+                server_name,
+                hostname=sftp_info["hostname"],
+                port=sftp_info["port"],
+                username=sftp_info["username"],
+                password=sftp_info["password"],
+                sftp_host=sftp_info["hostname"],
+                sftp_port=sftp_info["port"],
+                sftp_username=sftp_info["username"],
+                sftp_password=sftp_info["password"]
+            )
+
+            if not server:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Creation Failed",
+                    "Failed to create server entry in database."
+                , guild=guild_model)
+                await message.edit(embed=embed)
+                return
+
+            # Create server data for guild
+            server_data = {
+                "server_id": server.server_id,
+                "server_name": server_name,
+                "guild_id": str(ctx.guild.id),
+                "sftp_host": sftp_info["hostname"],
+                "sftp_port": sftp_info["port"],
+                "sftp_username": sftp_info["username"],
+                "sftp_password": sftp_info["password"],
+                "hostname": sftp_info["hostname"],
+                "port": sftp_info["port"],
+                "username": sftp_info["username"],
+                "password": sftp_info["password"],
+                "last_csv_line": 0,
+                "last_log_line": 0
+            }
+
+            # Add server to guild
+            add_result = await guild.add_server(server_data)
+            if not add_result:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Error Adding Server",
+                    "Failed to add server to the database. This may be due to a server limit restriction."
+                , guild=guild_model)
+                await message.edit(embed=embed)
+                await sftp_client.disconnect()
+                return
+
+            # Success message
+            embed = await EmbedBuilder.create_success_embed(
+                "Server Added Successfully",
+                f"Server '{server_name}' has been added and is ready for channel setup."
+            , guild=guild_model)
+
+            # Add connection details
+            connection_status = [
+                f"SFTP Connection: Successful",
+                f"Log File: {'Found' if log_found else 'Not found'}",
+                f"CSV Files: Will be located during historical parsing"
+            ]
+            embed.add_field(
+                name="Connection Status", 
+                value="\n".join(connection_status),
+                inline=False
+            )
+
+            # Add next steps
+            next_steps = [
+                "Use `/setup channels <server>` to configure notification channels.",
+                "Use `/killfeed start <server>` to start monitoring the killfeed.",
+                "If you have premium, use `/events start <server>` to monitor game events."
+            ]
+            embed.add_field(
+                name="Next Steps", 
+                value="\n".join(next_steps),
+                inline=False
+            )
+
+            await message.edit(embed=embed)
+            await sftp_client.disconnect()
+
+            # Start historical parsing automatically
+            try:
+                # Update the message with parsing info
+                embed = await EmbedBuilder.create_info_embed(
+                    "Historical Parse Starting",
+                    f"Starting automatic historical data parsing for server '{server_name}'."
+                    + "\n\nThis process will run in the background and may take some time depending on the amount of data."
+                , guild=guild_model)
+                await message.edit(embed=embed)
+            except Exception as e:
+                logger.error(f"Error starting historical parse for new server: {e}")
+
+        except Exception as e:
+            logger.error(f"Error in add_server command: {e}", exc_info=True)
+            try:
+                await hybrid_send(ctx, f"An error occurred while adding the server: {str(e)}")
+            except:
+                pass
+
+    @setup.command(name="removeserver", description="Remove a server from tracking")
+    @app_commands.describe(
+        server_id="ID of the server to remove"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    @app_commands.guild_only()
+    async def remove_server(self, ctx, server_id: str):
+        """Remove a server from tracking"""
+        try:
+            # Defer response to prevent timeout
+            await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild model with proper error handling
+            try:
+                guild_model = await Guild.get_or_create(self.bot.db, str(ctx.guild.id), ctx.guild.name)
+                if not guild_model:
+                    raise ValueError("Failed to get or create guild model")
+            except Exception as e:
+                logger.error(f"Error getting guild model: {e}")
+                embed = await EmbedBuilder.create_error_embed(
+                    "Database Error",
+                    "Failed to access guild configuration. Please try again later."
+                )
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Get server from database using proper lookup
+            server = await Server.get_by_id(self.bot.db, str(server_id), str(ctx.guild.id))
+            if not server:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Not Found", 
+                    f"Could not find server with ID '{server_id}'.",
+                    guild=guild_model
+                )
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Add confirmation button
+            class ConfirmView(discord.ui.View):
+                def __init__(self, timeout=60):
+                    super().__init__(timeout=timeout)
+
+                @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+                async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+                    if interaction.user.id != ctx.author.id:
+                        await interaction.response.send_message("You cannot use this button.", ephemeral=True)
+                        return
+
+                    try:
+                        # Remove server and its integrations
+                        success = await server.delete(self.bot.db)
+                        if not success:
+                            raise ValueError("Failed to delete server")
+
+                        # Remove from guild configuration
+                        await guild_model.remove_server(server.server_id)
+
+                        # Stop running tasks
+                        task_names = [
+                            f"killfeed_{ctx.guild.id}_{server_id}",
+                            f"events_{ctx.guild.id}_{server_id}"
+                        ]
+
+                        for task_name in task_names:
+                            if task_name in self.bot.background_tasks:
+                                self.bot.background_tasks[task_name].cancel()
+                                del self.bot.background_tasks[task_name]
+                                logger.info(f"Stopped task: {task_name}")
+
+                        embed = await EmbedBuilder.create_success_embed(
+                            "Server Removed",
+                            f"Successfully removed server '{server.name}'.",
+                            guild=guild_model
+                        )
+                        await interaction.response.edit_message(embed=embed, view=None)
+
+                    except Exception as e:
+                        logger.error(f"Error removing server: {e}")
+                        embed = await EmbedBuilder.create_error_embed(
+                            "Error",
+                            f"Failed to remove server: {str(e)}",
+                            guild=guild_model
+                        )
+                        await interaction.response.edit_message(embed=embed, view=None)
+
+                @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+                async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+                    if interaction.user.id != ctx.author.id:
+                        await interaction.response.send_message("You cannot use this button.", ephemeral=True)
+                        return
+
+                    embed = await EmbedBuilder.create_info_embed(
+                        "Cancelled",
+                        "Server removal cancelled.",
+                        guild=guild_model
+                    )
+                    await interaction.response.edit_message(embed=embed, view=None)
+
+            # Create confirmation embed
+            embed = await EmbedBuilder.create_warning_embed(
+                "Confirm Server Removal",
+                f"Are you sure you want to remove server '{server.name}' (ID: {server.server_id})?\n\n"
+                "This will remove all server configurations, stop monitoring, and delete historical data. "
+                "This action cannot be undone.",
+                guild=guild_model
+            )
+
+            # Send confirmation message
+            await hybrid_send(ctx, embed=embed, view=ConfirmView())
+
+        except Exception as e:
+            logger.error(f"Error in remove_server command: {e}")
+            try:
+                await hybrid_send(ctx, f"An error occurred: {str(e)}")
+            except:
+                pass
+
+    @setup.command(name="list_servers", description="List all configured servers for this guild")
+    @app_commands.guild_only()
+    async def list_servers_command(self, ctx):
+        """List all configured servers for this guild"""
+        try:
+            # For slash commands, defer response to prevent timeout
+            await ctx.defer()
+
+            # Get guild model
+            guild_id = str(ctx.guild.id)
+            guild = await Guild.get_by_id(self.bot.db, guild_id)
+            if not guild:
+                await hybrid_send(ctx, "No configuration found for this guild.")
+                return
+
+            # Get server count
+            server_count = len(guild.servers) if hasattr(guild, 'servers') and guild.servers is not None else 0
+
+            if server_count == 0:
+                embed = await EmbedBuilder.create_info_embed(
+                    "No Servers Configured",
+                    "This guild has no game servers configured yet. Use `/setup addserver` to add one.",
+                    guild=guild
+                )
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Create embed with server list
+            embed = await EmbedBuilder.create_info_embed(
+                "Configured Servers",
+                f"This guild has {server_count} server(s) configured:",
+                guild=guild
+            )
+
+            # Get premium tier
+            premium_tier = int(guild.premium_tier) if guild.premium_tier is not None else 0
+            tier_name = PREMIUM_TIERS.get(premium_tier, {}).get("name", f"Tier {premium_tier}")
+            max_servers = PREMIUM_TIERS.get(premium_tier, {}).get("max_servers", 1)
+
+            # Add premium tier info
+            embed.add_field(
+                name="Premium Tier",
+                value=f"{tier_name} ({server_count}/{max_servers} servers used)",
+                inline=False
+            )
+
+            # Add each server
+            for server in guild.servers:
+                server_name = server.get("server_name", "Unknown")
+                server_id = server.get("server_id", "unknown")
+                
+                killfeed_status = "Not started"
+                if f"killfeed_{guild_id}_{server_id}" in self.bot.background_tasks:
+                    task = self.bot.background_tasks[f"killfeed_{guild_id}_{server_id}"]
+                    if task.done():
+                        killfeed_status = "Stopped"
+                    else:
+                        killfeed_status = "Running"
+                
+                sftp_host = server.get("sftp_host", "Not set")
+                if sftp_host and server.get("sftp_port"):
+                    sftp_host = f"{sftp_host}:{server.get('sftp_port')}"
+                
+                # Create server field
+                field_value = [
+                    f"**ID:** {server_id}",
+                    f"**Status:** {killfeed_status}",
+                    f"**SFTP:** {sftp_host}"
+                ]
+                
+                embed.add_field(
+                    name=server_name,
+                    value="\n".join(field_value),
+                    inline=True
+                )
+
+            await hybrid_send(ctx, embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error listing servers: {e}")
+            await hybrid_send(ctx, f"An error occurred: {str(e)}")
+
+    async def _check_permission(self, ctx):
+        """Check if user has admin permissions. Returns True if user doesn't have permissions."""
+        if not has_admin_permission(ctx):
+            embed = await EmbedBuilder.create_error_embed(
+                "Permission Denied",
+                "You need administrator permissions to use this command."
+            )
+            await hybrid_send(ctx, embed=embed)
+            return True
+        return False
+
+    @setup.command(name="channels", description="Configure notification channels")
+    @app_commands.guild_only()
+    @app_commands.describe(
+        server_id="ID of the server to configure",
+        killfeed_channel="Channel for kill notifications"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    async def configure_channels(self, ctx, server_id: str, killfeed_channel: discord.TextChannel = None):
+        """Configure notification channels for a server"""
+        try:
+            # Defer response to prevent timeout
+            await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild and server models
+            guild_model = await Guild.get_or_create(self.bot.db, str(ctx.guild.id), ctx.guild.name)
+            if not guild_model:
+                await hybrid_send(ctx, "Error retrieving guild configuration.")
+                return
+
+            # Get server from guild configuration
+            server_data = None
+            for server in guild_model.servers:
+                if server.get("server_id") == server_id:
+                    server_data = server
+                    break
+
+            if not server_data:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Not Found",
+                    f"Server with ID '{server_id}' not found in this guild's configuration.",
+                    guild=guild_model
+                )
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Update channels configuration
+            updated = False
+
+            if killfeed_channel:
+                channel_id = str(killfeed_channel.id)
+                if "channels" not in server_data:
+                    server_data["channels"] = {}
+                server_data["channels"]["killfeed"] = channel_id
+                updated = True
+
+            # Update server configuration in guild model
+            if updated:
+                for i, server in enumerate(guild_model.servers):
+                    if server.get("server_id") == server_id:
+                        guild_model.servers[i] = server_data
+                        break
+
+                # Save updated guild model
+                result = await guild_model.save(self.bot.db)
+                if not result:
+                    embed = await EmbedBuilder.create_error_embed(
+                        "Update Failed",
+                        "Failed to update channel configuration.",
+                        guild=guild_model
+                    )
+                    await hybrid_send(ctx, embed=embed)
+                    return
+
+                # Success message
+                embed = await EmbedBuilder.create_success_embed(
+                    "Channels Configured",
+                    f"Channel configuration updated for server '{server_data.get('server_name')}'.",
+                    guild=guild_model
+                )
+
+                # Add channel overview
+                channels = []
+                if "channels" in server_data:
+                    for channel_type, channel_id in server_data["channels"].items():
+                        channel_name = f"<#{channel_id}>"
+                        channels.append(f"**{channel_type.capitalize()}:** {channel_name}")
+
+                if channels:
+                    embed.add_field(
+                        name="Configured Channels",
+                        value="\n".join(channels),
+                        inline=False
+                    )
+
+                await hybrid_send(ctx, embed=embed)
+            else:
+                # No changes made
+                embed = await EmbedBuilder.create_info_embed(
+                    "No Changes",
+                    "No channel configuration changes were made.",
+                    guild=guild_model
+                )
+                await hybrid_send(ctx, embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error configuring channels: {e}")
+            await hybrid_send(ctx, f"An error occurred: {str(e)}")
+
+async def setup(bot):
+    """Setup function for the Setup cog"""
+    await bot.add_cog(Setup(bot))

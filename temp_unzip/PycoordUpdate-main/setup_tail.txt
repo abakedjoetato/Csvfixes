@@ -1,0 +1,2000 @@
+            if not connected:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Connection Failed",
+                    f"Failed to connect to SFTP server: {sftp_client.last_error}"
+                , guild=guild_model)
+                await message.edit(embed=embed)
+                return
+
+            # Connection successful - skip CSV file check
+            # The historical parser will find CSV files on its own
+            # This eliminates redundant SFTP operations and reduces connection time
+            logger.info(f"SFTP connection successful for server {server_id}. Skipping redundant CSV file check.")
+            csv_files = []  # Empty placeholder since we don't need to check
+
+            # Check if we can find log file
+            embed = await EmbedBuilder.create_base_embed(
+                "Adding Server",
+                f"Connection successful. Looking for log file..."
+            , guild=guild_model)
+            await message.edit(embed=embed)
+
+            log_file = await sftp_client.get_log_file()
+            log_found = log_file is not None
+
+            # Create proper Server object first
+            server = await Server.create_server(
+                self.bot.db,
+                str(ctx.guild.id),
+                server_name,
+                hostname=sftp_info["hostname"],
+                port=sftp_info["port"],
+                username=sftp_info["username"],
+                password=sftp_info["password"],
+                sftp_host=sftp_info["hostname"],
+                sftp_port=sftp_info["port"],
+                sftp_username=sftp_info["username"],
+                sftp_password=sftp_info["password"]
+            )
+
+            if not server:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Creation Failed",
+                    "Failed to create server entry in database."
+                , guild=guild_model)
+                await message.edit(embed=embed)
+                return
+
+            # Create server data for guild
+            server_data = {
+                "server_id": server.server_id,
+                "server_name": server_name,
+                "guild_id": str(ctx.guild.id),
+                "sftp_host": sftp_info["hostname"],
+                "sftp_port": sftp_info["port"],
+                "sftp_username": sftp_info["username"],
+                "sftp_password": sftp_info["password"],
+                "hostname": sftp_info["hostname"],
+                "port": sftp_info["port"],
+                "username": sftp_info["username"],
+                "password": sftp_info["password"],
+                "last_csv_line": 0,
+                "last_log_line": 0
+            }
+
+            # Add server to guild
+            add_result = await guild.add_server(server_data)
+            if not add_result:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Error Adding Server",
+                    "Failed to add server to the database. This may be due to a server limit restriction."
+                , guild=guild_model)
+                await message.edit(embed=embed)
+                await sftp_client.disconnect()
+                return
+
+            # Success message
+            embed = await EmbedBuilder.create_success_embed(
+                "Server Added Successfully",
+                f"Server '{server_name}' has been added and is ready for channel setup."
+            , guild=guild_model)
+
+            # Add connection details
+            connection_status = [
+                f"SFTP Connection: Successful",
+                f"Log File: {'Found' if log_found else 'Not found'}",
+                f"CSV Files: Will be located during historical parsing"
+            ]
+            embed.add_field(
+                name="Connection Status", 
+                value="\n".join(connection_status),
+                inline=False
+            )
+
+            # Add next steps
+            next_steps = [
+                "Use `/setup channels <server>` to configure notification channels.",
+                "Use `/killfeed start <server>` to start monitoring the killfeed.",
+                "If you have premium, use `/events start <server>` to monitor game events."
+            ]
+            embed.add_field(
+                name="Next Steps", 
+                value="\n".join(next_steps),
+                inline=False
+            )
+
+            await message.edit(embed=embed)
+            await sftp_client.disconnect()
+
+            # Start historical parsing automatically
+            try:
+                # Update the message with parsing info
+                embed = await EmbedBuilder.create_info_embed(
+                    "Historical Parse Starting",
+                    f"Starting automatic historical data parsing for server '{server_name}'."
+                    + "\n\nThis process will run in the background and may take some time depending on the amount of data."
+                , guild=guild_model)
+                await message.edit(embed=embed)
+            except Exception as e:
+                logger.error(f"Error starting historical parse for new server: {e}")
+
+        except Exception as e:
+            logger.error(f"Error in add_server command: {e}", exc_info=True)
+            try:
+                await hybrid_send(ctx, f"An error occurred while adding the server: {str(e)}")
+            except:
+                pass
+
+    @setup.command(name="removeserver", description="Remove a server from tracking")
+    @app_commands.describe(
+        server_id="ID of the server to remove"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    @app_commands.guild_only()
+    async def remove_server(self, ctx, server_id: str):
+        """Remove a server from tracking"""
+        try:
+            # Defer response to prevent timeout
+            await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild model with proper error handling
+            try:
+                guild_model = await Guild.get_or_create(self.bot.db, str(ctx.guild.id), ctx.guild.name)
+                if not guild_model:
+                    raise ValueError("Failed to get or create guild model")
+            except Exception as e:
+                logger.error(f"Error getting guild model: {e}")
+                embed = await EmbedBuilder.create_error_embed(
+                    "Database Error",
+                    "Failed to access guild configuration. Please try again later."
+                )
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Get server from database using proper lookup
+            server = await Server.get_by_id(self.bot.db, str(server_id), str(ctx.guild.id))
+            if not server:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Not Found", 
+                    f"Could not find server with ID '{server_id}'.",
+                    guild=guild_model
+                )
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Add confirmation button
+            class ConfirmView(discord.ui.View):
+                def __init__(self, timeout=60):
+                    super().__init__(timeout=timeout)
+
+                @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
+                async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+                    if interaction.user.id != ctx.author.id:
+                        await interaction.response.send_message("You cannot use this button.", ephemeral=True)
+                        return
+
+                    try:
+                        # Remove server and its integrations
+                        success = await server.delete(self.bot.db)
+                        if not success:
+                            raise ValueError("Failed to delete server")
+
+                        # Remove from guild configuration
+                        await guild_model.remove_server(server.server_id)
+
+                        # Stop running tasks
+                        task_names = [
+                            f"killfeed_{ctx.guild.id}_{server_id}",
+                            f"events_{ctx.guild.id}_{server_id}"
+                        ]
+
+                        for task_name in task_names:
+                            if task_name in self.bot.background_tasks:
+                                self.bot.background_tasks[task_name].cancel()
+                                del self.bot.background_tasks[task_name]
+                                logger.info(f"Stopped task: {task_name}")
+
+                        embed = await EmbedBuilder.create_success_embed(
+                            "Server Removed",
+                            f"Successfully removed server '{server.name}'.",
+                            guild=guild_model
+                        )
+                        await interaction.response.edit_message(embed=embed, view=None)
+
+                    except Exception as e:
+                        logger.error(f"Error removing server: {e}")
+                        embed = await EmbedBuilder.create_error_embed(
+                            "Error",
+                            f"Failed to remove server: {str(e)}",
+                            guild=guild_model
+                        )
+                        await interaction.response.edit_message(embed=embed, view=None)
+
+                @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+                async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+                    if interaction.user.id != ctx.author.id:
+                        await interaction.response.send_message("You cannot use this button.", ephemeral=True)
+                        return
+
+                    embed = await EmbedBuilder.create_info_embed(
+                        "Cancelled",
+                        "Server removal cancelled.",
+                        guild=guild_model
+                    )
+                    await interaction.response.edit_message(embed=embed, view=None)
+
+            # Show confirmation message
+            embed = await EmbedBuilder.create_warning_embed(
+                "Confirm Server Removal",
+                f"Are you sure you want to remove server '{server.name}'?\n\n"
+                "This will:\n"
+                "• Stop all monitoring tasks\n"
+                "• Remove server configuration\n"
+                "• Remove all channel settings\n\n"
+                "This action cannot be undone.",
+                guild=guild_model
+            )
+            await hybrid_send(ctx, embed=embed, view=ConfirmView())
+
+        except Exception as e:
+            logger.error(f"Error in remove_server command: {e}", exc_info=True)
+            embed = await EmbedBuilder.create_error_embed(
+                "Error",
+                f"An unexpected error occurred: {str(e)}"
+            )
+            await hybrid_send(ctx, embed=embed)
+
+    @setup.command(name="channels", description="Configure notification channels for a server")
+    @app_commands.describe(
+        server_id="ID of the server to configure channels for",
+        killfeed_channel="Channel for killfeed notifications",
+        events_channel="Channel for event notifications",
+        connections_channel="Channel for player connection notifications",
+        economy_channel="Channel for economy notifications",
+        voice_status_channel="Voice channel for displaying server status"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    @app_commands.guild_only()
+    async def setup_channels(self, ctx, 
+                           server_id: str,
+                           killfeed_channel: discord.TextChannel = None,
+                           events_channel: discord.TextChannel = None,
+                           connections_channel: discord.TextChannel = None,
+                           economy_channel: discord.TextChannel = None,
+                           voice_status_channel: discord.VoiceChannel = None):
+        """Configure notification channels for a server with optimized performance"""
+        try:
+            # Defer response to prevent timeout
+            await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Define a progress update function
+            async def update_progress(message, step, total_steps, current_action):
+                embed = await EmbedBuilder.create_info_embed(
+                    "Setup Channels Progress",
+                    f"Configuring channels for server: {server_id}\n\n"
+                    f"Step {step}/{total_steps}: {current_action}"
+                )
+                await message.edit(embed=embed)
+
+            # Helper function to safely get channel ID
+            def safe_channel_id(channel):
+                return str(channel.id) if channel is not None else None
+
+            # Get guild and server from database
+            # Initial response
+            embed = await EmbedBuilder.create_info_embed(
+                "Setup Channels",
+                f"Configuring channels for server: {server_id}\n\n"
+                f"Step 1/4: Retrieving guild information..."
+            )
+            message = await ctx.followup.send(embed=embed)
+
+            # Get guild data
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Guild Not Found",
+                    "This guild is not registered in the database."
+                )
+                await message.edit(embed=embed)
+                return
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # Get the server by ID
+            await update_progress(message, 2, 4, "Getting server information...")
+            server = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+            if not server:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Not Found",
+                    f"Could not find a server with ID '{server_id}' in this guild."
+                , guild=guild)
+                await message.edit(embed=embed)
+                return
+
+            # Save channel configurations
+            await update_progress(message, 3, 4, "Saving channel configurations...")
+
+            # Create updates dict with only the values that were provided
+            updates = {}
+            if killfeed_channel is not None:
+                updates["killfeed_channel_id"] = safe_channel_id(killfeed_channel)
+            if events_channel is not None:
+                updates["events_channel_id"] = safe_channel_id(events_channel)
+            if connections_channel is not None:
+                updates["connections_channel_id"] = safe_channel_id(connections_channel)
+            if economy_channel is not None:
+                updates["economy_channel_id"] = safe_channel_id(economy_channel)
+            if voice_status_channel is not None:
+                updates["voice_status_channel_id"] = safe_channel_id(voice_status_channel)
+
+            # Skip update if nothing changed
+            if not updates:
+                embed = await EmbedBuilder.create_info_embed(
+                    "No Changes",
+                    "No channel configurations were provided to update."
+                , guild=guild)
+                await message.edit(embed=embed)
+                return
+
+            # Update server
+            success = await server.update(self.bot.db, updates)
+            if not success:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Update Failed",
+                    "Failed to update server channel configurations."
+                , guild=guild)
+                await message.edit(embed=embed)
+                return
+
+            # Finalize
+            await update_progress(message, 4, 4, "Channel setup complete!")
+
+            # Build summary of configured channels
+            channel_summary = []
+            if killfeed_channel is not None:
+                channel_summary.append(f"Killfeed: {killfeed_channel.mention}")
+            if events_channel is not None:
+                channel_summary.append(f"Events: {events_channel.mention}")
+            if connections_channel is not None:
+                channel_summary.append(f"Connections: {connections_channel.mention}")
+            if economy_channel is not None:
+                channel_summary.append(f"Economy: {economy_channel.mention}")
+            if voice_status_channel is not None:
+                channel_summary.append(f"Voice Status: {voice_status_channel.mention}")
+
+            # Final success message
+            embed = await EmbedBuilder.create_success_embed(
+                "Channels Configured Successfully",
+                f"Server '{server.name}' channel configurations have been updated."
+            , guild=guild)
+
+            # Add channel summary
+            if channel_summary:
+                embed.add_field(
+                    name="Channel Configurations", 
+                    value="\n".join(channel_summary),
+                    inline=False
+                )
+
+            # Add next steps
+            next_steps = []
+            if killfeed_channel is not None:
+                next_steps.append("• Use `/killfeed start <server>` to start monitoring the killfeed")
+            if events_channel is not None:
+                next_steps.append("• Use `/events start <server>` to start monitoring events")
+
+            if next_steps:
+                embed.add_field(
+                    name="Next Steps", 
+                    value="\n".join(next_steps),
+                    inline=False
+                )
+
+            await message.edit(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in setup_channels command: {e}", exc_info=True)
+            try:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Error",
+                    f"An error occurred: {str(e)}"
+                )
+                await ctx.followup.send(embed=embed)
+            except:
+                await ctx.followup.send(f"An error occurred: {str(e)}")
+
+    @setup.command(name="listservers", description="List all configured servers for this guild")
+    @app_commands.guild_only()
+    async def list_servers(self, ctx):
+        """List all configured servers for this guild"""
+        try:
+            # For slash commands, defer response to prevent timeout
+            await ctx.defer()
+
+            # Get guild data directly from database
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                await hybrid_send(ctx, "This guild is not registered in the database.")
+                return
+
+            # Get standalone servers data for cross-check
+            standalone_servers = await self.bot.db.servers.find({"guild_id": str(ctx.guild.id)}).to_list(length=100)
+
+            # Log server info for debugging
+            logger.info(f"Guild servers: {len(guild_data.get('servers', []))}, Standalone servers: {len(standalone_servers)}")
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # Check if we have any servers in either collection
+            if (not guild.servers or len(guild.servers) == 0) and len(standalone_servers) == 0:
+                embed = await EmbedBuilder.create_info_embed(
+                    "No Servers Configured",
+                    "This guild does not have any servers configured.\n\n"
+                    "Use `/setup addserver` to add a server."
+                , guild=guild)
+
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Combine servers from both collections
+            all_servers = []
+            guild_server_ids = set()
+
+            # Add servers from guild.servers
+            if guild.servers and len(guild.servers) > 0:
+                for server in guild.servers:
+                    server_id = server.get("server_id")
+                    if server_id:
+                        guild_server_ids.add(server_id)
+                        all_servers.append(server)
+
+            # Add any standalone servers not already included
+            for server in standalone_servers:
+                server_id = server.get("server_id")
+                if server_id and server_id not in guild_server_ids:
+                    # Log that we found a server in standalone but not in guild.servers
+                    logger.warning(f"Server {server_id} found in standalone servers but not in guild.servers. Adding it to display.")
+                    all_servers.append(server)
+
+            # Create embed
+            embed = await EmbedBuilder.create_info_embed(
+                "Configured Servers",
+                f"This guild has {len(all_servers)} configured server(s).\n\n"
+                f"Guild servers: {len(guild.servers)}, Standalone servers: {len(standalone_servers)}"
+            , guild=guild)
+
+            # Helper function to get channel mentions
+            def get_channel_mention(channel_id):
+                if channel_id:
+                    channel = ctx.guild.get_channel(int(channel_id))
+                    return channel.mention if channel else "Unknown channel"
+                return "Not set"
+
+            # List all servers
+            for i, server in enumerate(all_servers, 1):
+                server_id = server.get("server_id")
+                server_name = server.get("server_name", "Unnamed Server")
+
+                # Get server detailed info
+                server_obj = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+
+                # Get status emojis based on available features
+                killfeed_status = "✅" if server_obj and hasattr(server_obj, "killfeed_channel_id") and server_obj.killfeed_channel_id else "❌"
+                events_status = "✅" if server_obj and hasattr(server_obj, "events_channel_id") and server_obj.events_channel_id else "❌"
+                connections_status = "✅" if server_obj and hasattr(server_obj, "connections_channel_id") and server_obj.connections_channel_id else "❌"
+
+                # Determine if server is in both collections or only in standalone
+                in_guild = server_id in guild_server_ids
+                server_source = "Both Collections" if in_guild else "Standalone Only"
+
+                # Build config details
+                config_details = [
+                    f"**ID:** `{server_id}`",
+                    f"**Source:** `{server_source}`",
+                    f"**Killfeed:** {killfeed_status}",
+                    f"**Events:** {events_status}",
+                    f"**Connections:** {connections_status}"
+                ]
+
+                # Add server to embed
+                embed.add_field(
+                    name=f"{i}. {server_name}",
+                    value="\n".join(config_details),
+                    inline=True
+                )
+
+            # Send embed
+            await hybrid_send(ctx, embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in list_servers command: {e}", exc_info=True)
+            await hybrid_send(ctx, f"An error occurred: {str(e)}")
+
+    @setup.command(name="parsehistorical", description="Parse historical data for a server")
+    @app_commands.describe(
+        server_id="ID of the server to parse historical data for (leave empty for all servers)"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    @app_commands.guild_only()
+    async def historical_parse(self, ctx, server_id: str = None):
+        """Parse all historical data for a server"""
+        try:
+            # For slash commands, defer response to prevent timeout
+            await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild data
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                await hybrid_send(ctx, "This guild is not registered in the database.")
+                return
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # If no server ID was provided, ask to confirm parsing all servers
+            if server_id is None:
+                # Check if we have any servers
+                if not guild.servers or len(guild.servers) == 0:
+                    embed = await EmbedBuilder.create_info_embed(
+                        "No Servers Configured",
+                        "This guild does not have any servers configured."
+                    , guild=guild)
+
+                    await hybrid_send(ctx, embed=embed)
+                    return
+
+                # Show confirmation for all servers
+                embed = await EmbedBuilder.create_warning_embed(
+                    "Parse All Servers",
+                    f"You are about to parse historical data for all {len(guild.servers)} servers in this guild.\n\n"
+                    "This operation can take a long time depending on the amount of data.\n\n"
+                    "Use `/setup parsehistorical <server_id>` to parse a specific server instead."
+                , guild=guild)
+
+                # Send embed using hybrid helper
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Get the server by ID
+            server = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+            if not server:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Not Found",
+                    f"Could not find a server with ID '{server_id}' in this guild."
+                , guild=guild)
+
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Start historical parse
+            embed = await EmbedBuilder.create_info_embed(
+                "Historical Parse Starting",
+                f"Starting historical data parsing for server '{server.name}'.\n\n"
+                "This process will run in the background and may take some time depending on the amount of data. "
+                "Progress updates will be sent to this channel."
+            , guild=guild)
+
+            # Send using hybrid helper
+            message = await hybrid_send(ctx, embed=embed)
+
+            # Start the historical parse task
+            background_task = asyncio.create_task(self._historical_parse_task(server, message))
+
+            # Store the task in the bot instance to prevent it from being garbage collected
+            if not hasattr(self.bot, 'background_tasks'):
+                self.bot.background_tasks = []
+            self.bot.background_tasks.append(background_task)
+
+        except Exception as e:
+            logger.error(f"Error in historical_parse command: {e}", exc_info=True)
+            await hybrid_send(ctx, f"An error occurred: {str(e)}")
+
+    async def _historical_parse_task(self, server, message):
+        """Background task for parsing historical data"""
+        try:
+            # Create SFTP client for the server
+            sftp_client = SFTPClient(
+                hostname=server.sftp_host,
+                port=server.sftp_port,
+                username=server.sftp_username,
+                password=server.sftp_password,
+                server_id=server.server_id
+            )
+
+            # Connect to SFTP
+            connected = await sftp_client.connect()
+            if not connected:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Connection Failed",
+                    f"Failed to connect to SFTP server: {sftp_client.last_error}"
+                )
+                await message.edit(embed=embed)
+                return
+
+            # Find all CSV files
+            embed = await EmbedBuilder.create_info_embed(
+                "Finding Files",
+                "Searching for CSV files..."
+            )
+            await message.edit(embed=embed)
+
+            # Look for CSV files in common locations
+            csv_files = await sftp_client.find_csv_files()
+
+            if not csv_files:
+                embed = await EmbedBuilder.create_error_embed(
+                    "No Files Found",
+                    "Could not find any CSV files on the server."
+                )
+                await message.edit(embed=embed)
+                await sftp_client.disconnect()
+                return
+
+            # Update with file count
+            embed = await EmbedBuilder.create_info_embed(
+                "Found Files",
+                f"Found {len(csv_files)} CSV files. Starting parse..."
+            )
+            await message.edit(embed=embed)
+
+            # Create CSV parser
+            csv_parser = CSVParser(server.server_id)
+
+            # Define a progress update function
+            total_size = 0
+            processed_size = 0
+            kills_processed = 0
+
+            async def update_progress(current_size, current_files, kills, lines_processed=0, estimated=None):
+                nonlocal processed_size
+                nonlocal kills_processed
+
+                processed_size += current_size
+                kills_processed += kills
+
+                progress_percent = (processed_size / total_size) * 100 if total_size > 0 else 0
+
+                # Update message with progress
+                embed = await EmbedBuilder.create_info_embed(
+                    "Parsing Progress",
+                    f"Parsing historical data for server '{server.name}':\n\n"
+                    f"• Files processed: {current_files}/{len(csv_files)}\n"
+                    f"• Progress: {progress_percent:.2f}%\n"
+                    f"• Kills processed: {kills_processed}\n"
+                    f"• Lines processed: {lines_processed:,}\n"
+                )
+
+                if estimated is not None:
+                    embed.add_field(
+                        name="Estimated Time Remaining",
+                        value=f"{estimated} minutes",
+                        inline=False
+                    )
+
+                await message.edit(embed=embed)
+
+            # Calculate total size of files to process
+            for file_path in csv_files:
+                file_info = await sftp_client.get_file_info(file_path)
+                if file_info and 'size' in file_info:
+                    total_size += file_info['size']
+
+            # Process each file
+            for i, file_path in enumerate(csv_files, 1):
+                try:
+                    # Get file info
+                    file_info = await sftp_client.get_file_info(file_path)
+                    if not file_info or 'size' not in file_info:
+                        logger.warning(f"Could not get size for file {file_path}")
+                        file_size = 0
+                    else:
+                        file_size = file_info['size']
+
+                    # Download file
+                    local_file = await sftp_client.download_file(file_path)
+                    if not local_file:
+                        logger.warning(f"Failed to download {file_path}")
+                        continue
+
+                    # Parse file
+                    result = await csv_parser.parse_file(
+                        self.bot.db, 
+                        local_file, 
+                        callback=lambda progress, kills, lines, estimated: 
+                            update_progress(file_size * progress, i, kills, lines, estimated)
+                    )
+
+                    # Clean up local file
+                    try:
+                        os.remove(local_file)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove temp file {local_file}: {e}")
+
+                except Exception as e:
+                    logger.error(f"Error processing file {file_path}: {e}")
+
+            # Disconnect SFTP
+            await sftp_client.disconnect()
+
+            # Final report
+            embed = await EmbedBuilder.create_success_embed(
+                "Parse Complete",
+                f"Successfully parsed historical data for server '{server.name}'.\n\n"
+                f"• Files processed: {len(csv_files)}\n"
+                f"• Kills processed: {kills_processed}\n"
+            )
+            await message.edit(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in historical parse task: {e}", exc_info=True)
+            try:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Parse Error",
+                    f"An error occurred during historical parsing: {str(e)}"
+                )
+                await message.edit(embed=embed)
+            except:
+                pass
+
+    @setup.command(name="diagnosedb", description="Diagnose database issues")
+    @app_commands.describe(
+        server_id="ID of the server to diagnose (optional)"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    @app_commands.guild_only()
+    async def diagnose_db(self, ctx, server_id: str = None):
+        """Diagnose database type consistency issues."""
+        try:
+            # For slash commands, defer response to prevent timeout
+            # For text commands, this will be a noop
+            if hasattr(ctx, 'interaction') and ctx.interaction:
+                await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild data
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                # Use appropriate response method based on context
+                if hasattr(ctx, 'interaction') and ctx.interaction:
+                    await ctx.followup.send("This guild is not registered in the database.")
+                else:
+                    await ctx.send("This guild is not registered in the database.")
+                return
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # Create initial response
+            embed = await EmbedBuilder.create_info_embed(
+                "Database Diagnosis",
+                "Analyzing database records for consistency issues..."
+            , guild=guild)
+
+            # Send using hybrid helper
+            message = await hybrid_send(ctx, embed=embed)
+
+            issues = []
+
+            # Check guild document
+            guild_issues = []
+
+            if 'guild_id' not in guild_data:
+                guild_issues.append("Missing guild_id field")
+            elif not isinstance(guild_data['guild_id'], str):
+                guild_issues.append(f"guild_id is not a string type: {type(guild_data['guild_id']).__name__}")
+
+            if 'premium_tier' in guild_data:
+                if not isinstance(guild_data['premium_tier'], int):
+                    guild_issues.append(f"premium_tier is not an integer type: {type(guild_data['premium_tier']).__name__}")
+
+            if 'servers' in guild_data:
+                if not isinstance(guild_data['servers'], list):
+                    guild_issues.append(f"servers is not a list type: {type(guild_data['servers']).__name__}")
+
+            if guild_issues:
+                issues.append(f"**Guild Issues:**\n- " + "\n- ".join(guild_issues))
+
+            # If server_id is provided, check that specific server
+            if server_id:
+                # Get the server document
+                server = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+                if not server:
+                    embed = await EmbedBuilder.create_error_embed(
+                        "Server Not Found",
+                        f"Could not find a server with ID '{server_id}' in this guild."
+                    , guild=guild)
+                    await message.edit(embed=embed)
+                    return
+
+                # Check server document from db
+                server_doc = await self.bot.db.game_servers.find_one({"server_id": server_id})
+                if not server_doc:
+                    embed = await EmbedBuilder.create_error_embed(
+                        "Server Document Not Found",
+                        f"Could not find a database document for server '{server_id}'."
+                    , guild=guild)
+                    await message.edit(embed=embed)
+                    return
+
+                server_issues = []
+
+                # Check server_id type
+                if 'server_id' not in server_doc:
+                    server_issues.append("Missing server_id field")
+                elif not isinstance(server_doc['server_id'], str):
+                    server_issues.append(f"server_id is not a string type: {type(server_doc['server_id']).__name__}")
+
+                # Check guild_id type
+                if 'guild_id' not in server_doc:
+                    server_issues.append("Missing guild_id field")
+                elif not isinstance(server_doc['guild_id'], str):
+                    server_issues.append(f"guild_id is not a string type: {type(server_doc['guild_id']).__name__}")
+
+                # Check SFTP settings
+                if 'sftp_host' in server_doc and server_doc['sftp_host'] is not None and not isinstance(server_doc['sftp_host'], str):
+                    server_issues.append(f"sftp_host is not a string type: {type(server_doc['sftp_host']).__name__}")
+
+                if 'sftp_port' in server_doc and server_doc['sftp_port'] is not None and not isinstance(server_doc['sftp_port'], int):
+                    server_issues.append(f"sftp_port is not an integer type: {type(server_doc['sftp_port']).__name__}")
+
+                # Check channel IDs
+                for channel_field in ['killfeed_channel_id', 'events_channel_id', 'connections_channel_id']:
+                    if channel_field in server_doc and server_doc[channel_field] is not None:
+                        if not isinstance(server_doc[channel_field], str):
+                            server_issues.append(f"{channel_field} is not a string type: {type(server_doc[channel_field]).__name__}")
+
+                if server_issues:
+                    issues.append(f"**Server Issues ({server.name}):**\n- " + "\n- ".join(server_issues))
+
+                # Check for duplicate server entries
+                duplicate_check = await self.bot.db.game_servers.count_documents({"server_id": server_id})
+                if duplicate_check > 1:
+                    issues.append(f"**Duplicate Entries:**\nFound {duplicate_check} documents with server_id '{server_id}'")
+
+                # Check for any players
+                player_count = await self.bot.db.players.count_documents({"server_id": server_id})
+
+                # Sample some player documents for type issues
+                if player_count > 0:
+                    player_issues = []
+                    players = await self.bot.db.players.find({"server_id": server_id}).limit(5).to_list(length=5)
+
+                    for player in players:
+                        if 'server_id' in player and not isinstance(player['server_id'], str):
+                            player_issues.append(f"player {player.get('name', '?')}: server_id is not a string type")
+
+                        if 'kills' in player and not isinstance(player['kills'], int):
+                            player_issues.append(f"player {player.get('name', '?')}: kills is not an integer type")
+
+                    if player_issues:
+                        issues.append(f"**Player Issues (sample of {min(player_count, 5)}/{player_count}):**\n- " + "\n- ".join(player_issues))
+
+            else:
+                # Check all servers
+                server_issues = []
+                servers = await self.bot.db.game_servers.find({"guild_id": str(ctx.guild.id)}).to_list(length=100)
+
+                for server_doc in servers:
+                    if 'server_id' not in server_doc:
+                        server_issues.append(f"Server missing server_id field")
+                        continue
+
+                    server_id = server_doc['server_id']
+                    server_name = server_doc.get('name', server_id)
+
+                    # Check type issues
+                    issues_found = []
+
+                    if not isinstance(server_id, str):
+                        issues_found.append(f"server_id is not a string type: {type(server_id).__name__}")
+
+                    if 'guild_id' not in server_doc:
+                        issues_found.append("Missing guild_id field")
+                    elif not isinstance(server_doc['guild_id'], str):
+                        issues_found.append(f"guild_id is not a string type: {type(server_doc['guild_id']).__name__}")
+
+                    if issues_found:
+                        server_issues.append(f"Server '{server_name}': " + ", ".join(issues_found))
+
+                if server_issues:
+                    issues.append(f"**Server Issues (summary):**\n- " + "\n- ".join(server_issues))
+
+            # Final report
+            if issues:
+                embed = await EmbedBuilder.create_warning_embed(
+                    "Database Diagnosis Results",
+                    f"Found {len(issues)} issue categories in the database:\n\n" + "\n\n".join(issues)
+                , guild=guild)
+            else:
+                embed = await EmbedBuilder.create_success_embed(
+                    "Database Diagnosis Results",
+                    "No issues found in the database. All data types appear to be consistent."
+                , guild=guild)
+
+            await message.edit(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in diagnose_db command: {e}", exc_info=True)
+            try:
+                await hybrid_send(ctx, f"An error occurred while diagnosing the database: {str(e)}")
+            except:
+                pass
+
+    @setup.command(name="listservers", description="List all configured servers for this guild")
+    @app_commands.guild_only()
+    async def list_servers(self, ctx):
+        """List all configured servers for this guild"""
+        try:
+            # For slash commands, defer response to prevent timeout
+            await ctx.defer()
+
+            # Get guild data directly from database
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                await hybrid_send(ctx, "This guild is not registered in the database.")
+                return
+
+            # Get standalone servers data for cross-check
+            standalone_servers = await self.bot.db.servers.find({"guild_id": str(ctx.guild.id)}).to_list(length=100)
+
+            # Log server info for debugging
+            logger.info(f"Guild servers: {len(guild_data.get('servers', []))}, Standalone servers: {len(standalone_servers)}")
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # Check if we have any servers in either collection
+            if (not guild.servers or len(guild.servers) == 0) and len(standalone_servers) == 0:
+                embed = await EmbedBuilder.create_info_embed(
+                    "No Servers Configured",
+                    "This guild does not have any servers configured.\n\n"
+                    "Use `/setup addserver` to add a server."
+                , guild=guild)
+
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Combine servers from both collections
+            all_servers = []
+            guild_server_ids = set()
+
+            # Add servers from guild.servers
+            if guild.servers and len(guild.servers) > 0:
+                for server in guild.servers:
+                    server_id = server.get("server_id")
+                    if server_id:
+                        guild_server_ids.add(server_id)
+                        all_servers.append(server)
+
+            # Add any standalone servers not already included
+            for server in standalone_servers:
+                server_id = server.get("server_id")
+                if server_id and server_id not in guild_server_ids:
+                    # Log that we found a server in standalone but not in guild.servers
+                    logger.warning(f"Server {server_id} found in standalone servers but not in guild.servers. Adding it to display.")
+                    all_servers.append(server)
+
+            # Create embed
+            embed = await EmbedBuilder.create_info_embed(
+                "Configured Servers",
+                f"This guild has {len(all_servers)} configured server(s).\n\n"
+                f"Guild servers: {len(guild.servers)}, Standalone servers: {len(standalone_servers)}"
+            , guild=guild)
+
+            # Helper function to get channel mentions
+            def get_channel_mention(channel_id):
+                if channel_id:
+                    channel = ctx.guild.get_channel(int(channel_id))
+                    return channel.mention if channel else "Unknown channel"
+                return "Not set"
+
+            # List all servers
+            for i, server in enumerate(all_servers, 1):
+                server_id = server.get("server_id")
+                server_name = server.get("server_name", "Unnamed Server")
+
+                # Get server detailed info
+                server_obj = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+
+                # Get status emojis based on available features
+                killfeed_status = "✅" if server_obj and hasattr(server_obj, "killfeed_channel_id") and server_obj.killfeed_channel_id else "❌"
+                events_status = "✅" if server_obj and hasattr(server_obj, "events_channel_id") and server_obj.events_channel_id else "❌"
+                connections_status = "✅" if server_obj and hasattr(server_obj, "connections_channel_id") and server_obj.connections_channel_id else "❌"
+
+                # Determine if server is in both collections or only in standalone
+                in_guild = server_id in guild_server_ids
+                server_source = "Both Collections" if in_guild else "Standalone Only"
+
+                # Build config details
+                config_details = [
+                    f"**ID:** `{server_id}`",
+                    f"**Source:** `{server_source}`",
+                    f"**Killfeed:** {killfeed_status}",
+                    f"**Events:** {events_status}",
+                    f"**Connections:** {connections_status}"
+                ]
+
+                # Add server to embed
+                embed.add_field(
+                    name=f"{i}. {server_name}",
+                    value="\n".join(config_details),
+                    inline=True
+                )
+
+            # Send embed
+            await hybrid_send(ctx, embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in list_servers command: {e}", exc_info=True)
+            await hybrid_send(ctx, f"An error occurred: {str(e)}")
+
+    @setup.command(name="parsehistorical", description="Parse historical data for a server")
+    @app_commands.describe(
+        server_id="ID of the server to parse historical data for (leave empty for all servers)"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    @app_commands.guild_only()
+    async def historical_parse(self, ctx, server_id: str = None):
+        """Parse all historical data for a server"""
+        try:
+            # For slash commands, defer response to prevent timeout
+            await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild data
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                await hybrid_send(ctx, "This guild is not registered in the database.")
+                return
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # If no server ID was provided, ask to confirm parsing all servers
+            if server_id is None:
+                # Check if we have any servers
+                if not guild.servers or len(guild.servers) == 0:
+                    embed = await EmbedBuilder.create_info_embed(
+                        "No Servers Configured",
+                        "This guild does not have any servers configured."
+                    , guild=guild)
+
+                    await hybrid_send(ctx, embed=embed)
+                    return
+
+                # Show confirmation for all servers
+                embed = await EmbedBuilder.create_warning_embed(
+                    "Parse All Servers",
+                    f"You are about to parse historical data for all {len(guild.servers)} servers in this guild.\n\n"
+                    "This operation can take a long time depending on the amount of data.\n\n"
+                    "Use `/setup parsehistorical <server_id>` to parse a specific server instead."
+                , guild=guild)
+
+                # Send embed using hybrid helper
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Get the server by ID
+            server = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+            if not server:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Not Found",
+                    f"Could not find a server with ID '{server_id}' in this guild."
+                , guild=guild)
+
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Start historical parse
+            embed = await EmbedBuilder.create_info_embed(
+                "Historical Parse Starting",
+                f"Starting historical data parsing for server '{server.name}'.\n\n"
+                "This process will run in the background and may take some time depending on the amount of data. "
+                "Progress updates will be sent to this channel."
+            , guild=guild)
+
+            # Send using hybrid helper
+            message = await hybrid_send(ctx, embed=embed)
+
+            # Start the historical parse task
+            background_task = asyncio.create_task(self._historical_parse_task(server, message))
+
+            # Store the task in the bot instance to prevent it from being garbage collected
+            if not hasattr(self.bot, 'background_tasks'):
+                self.bot.background_tasks = []
+            self.bot.background_tasks.append(background_task)
+
+        except Exception as e:
+            logger.error(f"Error in historical_parse command: {e}", exc_info=True)
+            await hybrid_send(ctx, f"An error occurred: {str(e)}")
+
+    async def _historical_parse_task(self, server, message):
+        """Background task for parsing historical data"""
+        try:
+            # Create SFTP client for the server
+            sftp_client = SFTPClient(
+                hostname=server.sftp_host,
+                port=server.sftp_port,
+                username=server.sftp_username,
+                password=server.sftp_password,
+                server_id=server.server_id
+            )
+
+            # Connect to SFTP
+            connected = await sftp_client.connect()
+            if not connected:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Connection Failed",
+                    f"Failed to connect to SFTP server: {sftp_client.last_error}"
+                )
+                await message.edit(embed=embed)
+                return
+
+            # Find all CSV files
+            embed = await EmbedBuilder.create_info_embed(
+                "Finding Files",
+                "Searching for CSV files..."
+            )
+            await message.edit(embed=embed)
+
+            # Look for CSV files in common locations
+            csv_files = await sftp_client.find_csv_files()
+
+            if not csv_files:
+                embed = await EmbedBuilder.create_error_embed(
+                    "No Files Found",
+                    "Could not find any CSV files on the server."
+                )
+                await message.edit(embed=embed)
+                await sftp_client.disconnect()
+                return
+
+            # Update with file count
+            embed = await EmbedBuilder.create_info_embed(
+                "Found Files",
+                f"Found {len(csv_files)} CSV files. Starting parse..."
+            )
+            await message.edit(embed=embed)
+
+            # Create CSV parser
+            csv_parser = CSVParser(server.server_id)
+
+            # Define a progress update function
+            total_size = 0
+            processed_size = 0
+            kills_processed = 0
+
+            async def update_progress(current_size, current_files, kills, lines_processed=0, estimated=None):
+                nonlocal processed_size
+                nonlocal kills_processed
+
+                processed_size += current_size
+                kills_processed += kills
+
+                progress_percent = (processed_size / total_size) * 100 if total_size > 0 else 0
+
+                # Update message with progress
+                embed = await EmbedBuilder.create_info_embed(
+                    "Parsing Progress",
+                    f"Parsing historical data for server '{server.name}':\n\n"
+                    f"• Files processed: {current_files}/{len(csv_files)}\n"
+                    f"• Progress: {progress_percent:.2f}%\n"
+                    f"• Kills processed: {kills_processed}\n"
+                    f"• Lines processed: {lines_processed:,}\n"
+                )
+
+                if estimated is not None:
+                    embed.add_field(
+                        name="Estimated Time Remaining",
+                        value=f"{estimated} minutes",
+                        inline=False
+                    )
+
+                await message.edit(embed=embed)
+
+            # Calculate total size of files to process
+            for file_path in csv_files:
+                file_info = await sftp_client.get_file_info(file_path)
+                if file_info and 'size' in file_info:
+                    total_size += file_info['size']
+
+            # Process each file
+            for i, file_path in enumerate(csv_files, 1):
+                try:
+                    # Get file info
+                    file_info = await sftp_client.get_file_info(file_path)
+                    if not file_info or 'size' not in file_info:
+                        logger.warning(f"Could not get size for file {file_path}")
+                        file_size = 0
+                    else:
+                        file_size = file_info['size']
+
+                    # Download file
+                    local_file = await sftp_client.download_file(file_path)
+                    if not local_file:
+                        logger.warning(f"Failed to download {file_path}")
+                        continue
+
+                    # Parse file
+                    result = await csv_parser.parse_file(
+                        self.bot.db, 
+                        local_file, 
+                        callback=lambda progress, kills, lines, estimated: 
+                            update_progress(file_size * progress, i, kills, lines, estimated)
+                    )
+
+                    # Clean up local file
+                    try:
+                        os.remove(local_file)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove temp file {local_file}: {e}")
+
+                except Exception as e:
+                    logger.error(f"Error processing file {file_path}: {e}")
+
+            # Disconnect SFTP
+            await sftp_client.disconnect()
+
+            # Final report
+            embed = await EmbedBuilder.create_success_embed(
+                "Parse Complete",
+                f"Successfully parsed historical data for server '{server.name}'.\n\n"
+                f"• Files processed: {len(csv_files)}\n"
+                f"• Kills processed: {kills_processed}\n"
+            )
+            await message.edit(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in historical parse task: {e}", exc_info=True)
+            try:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Parse Error",
+                    f"An error occurred during historical parsing: {str(e)}"
+                )
+                await message.edit(embed=embed)
+            except:
+                pass
+
+    @setup.command(name="diagnosedb", description="Diagnose database issues")
+    @app_commands.describe(
+        server_id="ID of the server to diagnose (optional)"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    @app_commands.guild_only()
+    async def diagnose_db(self, ctx, server_id: str = None):
+        """Diagnose database type consistency issues."""
+        try:
+            # For slash commands, defer response to prevent timeout
+            # For text commands, this will be a noop
+            if hasattr(ctx, 'interaction') and ctx.interaction:
+                await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild data
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                # Use appropriate response method based on context
+                if hasattr(ctx, 'interaction') and ctx.interaction:
+                    await ctx.followup.send("This guild is not registered in the database.")
+                else:
+                    await ctx.send("This guild is not registered in the database.")
+                return
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # Create initial response
+            embed = await EmbedBuilder.create_info_embed(
+                "Database Diagnosis",
+                "Analyzing database records for consistency issues..."
+            , guild=guild)
+
+            # Send using hybrid helper
+            message = await hybrid_send(ctx, embed=embed)
+
+            issues = []
+
+            # Check guild document
+            guild_issues = []
+
+            if 'guild_id' not in guild_data:
+                guild_issues.append("Missing guild_id field")
+            elif not isinstance(guild_data['guild_id'], str):
+                guild_issues.append(f"guild_id is not a string type: {type(guild_data['guild_id']).__name__}")
+
+            if 'premium_tier' in guild_data:
+                if not isinstance(guild_data['premium_tier'], int):
+                    guild_issues.append(f"premium_tier is not an integer type: {type(guild_data['premium_tier']).__name__}")
+
+            if 'servers' in guild_data:
+                if not isinstance(guild_data['servers'], list):
+                    guild_issues.append(f"servers is not a list type: {type(guild_data['servers']).__name__}")
+
+            if guild_issues:
+                issues.append(f"**Guild Issues:**\n- " + "\n- ".join(guild_issues))
+
+            # If server_id is provided, check that specific server
+            if server_id:
+                # Get the server document
+                server = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+                if not server:
+                    embed = await EmbedBuilder.create_error_embed(
+                        "Server Not Found",
+                        f"Could not find a server with ID '{server_id}' in this guild."
+                    , guild=guild)
+                    await message.edit(embed=embed)
+                    return
+
+                # Check server document from db
+                server_doc = await self.bot.db.game_servers.find_one({"server_id": server_id})
+                if not server_doc:
+                    embed = await EmbedBuilder.create_error_embed(
+                        "Server Document Not Found",
+                        f"Could not find a database document for server '{server_id}'."
+                    , guild=guild)
+                    await message.edit(embed=embed)
+                    return
+
+                server_issues = []
+
+                # Check server_id type
+                if 'server_id' not in server_doc:
+                    server_issues.append("Missing server_id field")
+                elif not isinstance(server_doc['server_id'], str):
+                    server_issues.append(f"server_id is not a string type: {type(server_doc['server_id']).__name__}")
+
+                # Check guild_id type
+                if 'guild_id' not in server_doc:
+                    server_issues.append("Missing guild_id field")
+                elif not isinstance(server_doc['guild_id'], str):
+                    server_issues.append(f"guild_id is not a string type: {type(server_doc['guild_id']).__name__}")
+
+                # Check SFTP settings
+                if 'sftp_host' in server_doc and server_doc['sftp_host'] is not None and not isinstance(server_doc['sftp_host'], str):
+                    server_issues.append(f"sftp_host is not a string type: {type(server_doc['sftp_host']).__name__}")
+
+                if 'sftp_port' in server_doc and server_doc['sftp_port'] is not None and not isinstance(server_doc['sftp_port'], int):
+                    server_issues.append(f"sftp_port is not an integer type: {type(server_doc['sftp_port']).__name__}")
+
+                # Check channel IDs
+                for channel_field in ['killfeed_channel_id', 'events_channel_id', 'connections_channel_id']:
+                    if channel_field in server_doc and server_doc[channel_field] is not None:
+                        if not isinstance(server_doc[channel_field], str):
+                            server_issues.append(f"{channel_field} is not a string type: {type(server_doc[channel_field]).__name__}")
+
+                if server_issues:
+                    issues.append(f"**Server Issues ({server.name}):**\n- " + "\n- ".join(server_issues))
+
+                # Check for duplicate server entries
+                duplicate_check = await self.bot.db.game_servers.count_documents({"server_id": server_id})
+                if duplicate_check > 1:
+                    issues.append(f"**Duplicate Entries:**\nFound {duplicate_check} documents with server_id '{server_id}'")
+
+                # Check for any players
+                player_count = await self.bot.db.players.count_documents({"server_id": server_id})
+
+                # Sample some player documents for type issues
+                if player_count > 0:
+                    player_issues = []
+                    players = await self.bot.db.players.find({"server_id": server_id}).limit(5).to_list(length=5)
+
+                    for player in players:
+                        if 'server_id' in player and not isinstance(player['server_id'], str):
+                            player_issues.append(f"player {player.get('name', '?')}: server_id is not a string type")
+
+                        if 'kills' in player and not isinstance(player['kills'], int):
+                            player_issues.append(f"player {player.get('name', '?')}: kills is not an integer type")
+
+                    if player_issues:
+                        issues.append(f"**Player Issues (sample of {min(player_count, 5)}/{player_count}):**\n- " + "\n- ".join(player_issues))
+
+            else:
+                # Check all servers
+                server_issues = []
+                servers = await self.bot.db.game_servers.find({"guild_id": str(ctx.guild.id)}).to_list(length=100)
+
+                for server_doc in servers:
+                    if 'server_id' not in server_doc:
+                        server_issues.append(f"Server missing server_id field")
+                        continue
+
+                    server_id = server_doc['server_id']
+                    server_name = server_doc.get('name', server_id)
+
+                    # Check type issues
+                    issues_found = []
+
+                    if not isinstance(server_id, str):
+                        issues_found.append(f"server_id is not a string type: {type(server_id).__name__}")
+
+                    if 'guild_id' not in server_doc:
+                        issues_found.append("Missing guild_id field")
+                    elif not isinstance(server_doc['guild_id'], str):
+                        issues_found.append(f"guild_id is not a string type: {type(server_doc['guild_id']).__name__}")
+
+                    if issues_found:
+                        server_issues.append(f"Server '{server_name}': " + ", ".join(issues_found))
+
+                if server_issues:
+                    issues.append(f"**Server Issues (summary):**\n- " + "\n- ".join(server_issues))
+
+            # Final report
+            if issues:
+                embed = await EmbedBuilder.create_warning_embed(
+                    "Database Diagnosis Results",
+                    f"Found {len(issues)} issue categories in the database:\n\n" + "\n\n".join(issues)
+                , guild=guild)
+            else:
+                embed = await EmbedBuilder.create_success_embed(
+                    "Database Diagnosis Results",
+                    "No issues found in the database. All data types appear to be consistent."
+                , guild=guild)
+
+            await message.edit(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in diagnose_db command: {e}", exc_info=True)
+            try:
+                await hybrid_send(ctx, f"An error occurred while diagnosing the database: {str(e)}")
+            except:
+                pass
+
+    @setup.command(name="listservers", description="List all configured servers for this guild")
+    @app_commands.guild_only()
+    async def list_servers(self, ctx):
+        """List all configured servers for this guild"""
+        try:
+            # For slash commands, defer response to prevent timeout
+            await ctx.defer()
+
+            # Get guild data directly from database
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                await hybrid_send(ctx, "This guild is not registered in the database.")
+                return
+
+            # Get standalone servers data for cross-check
+            standalone_servers = await self.bot.db.servers.find({"guild_id": str(ctx.guild.id)}).to_list(length=100)
+
+            # Log server info for debugging
+            logger.info(f"Guild servers: {len(guild_data.get('servers', []))}, Standalone servers: {len(standalone_servers)}")
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # Check if we have any servers in either collection
+            if (not guild.servers or len(guild.servers) == 0) and len(standalone_servers) == 0:
+                embed = await EmbedBuilder.create_info_embed(
+                    "No Servers Configured",
+                    "This guild does not have any servers configured.\n\n"
+                    "Use `/setup addserver` to add a server."
+                , guild=guild)
+
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Combine servers from both collections
+            all_servers = []
+            guild_server_ids = set()
+
+            # Add servers from guild.servers
+            if guild.servers and len(guild.servers) > 0:
+                for server in guild.servers:
+                    server_id = server.get("server_id")
+                    if server_id:
+                        guild_server_ids.add(server_id)
+                        all_servers.append(server)
+
+            # Add any standalone servers not already included
+            for server in standalone_servers:
+                server_id = server.get("server_id")
+                if server_id and server_id not in guild_server_ids:
+                    # Log that we found a server in standalone but not in guild.servers
+                    logger.warning(f"Server {server_id} found in standalone servers but not in guild.servers. Adding it to display.")
+                    all_servers.append(server)
+
+            # Create embed
+            embed = await EmbedBuilder.create_info_embed(
+                "Configured Servers",
+                f"This guild has {len(all_servers)} configured server(s).\n\n"
+                f"Guild servers: {len(guild.servers)}, Standalone servers: {len(standalone_servers)}"
+            , guild=guild)
+
+            # Helper function to get channel mentions
+            def get_channel_mention(channel_id):
+                if channel_id:
+                    channel = ctx.guild.get_channel(int(channel_id))
+                    return channel.mention if channel else "Unknown channel"
+                return "Not set"
+
+            # List all servers
+            for i, server in enumerate(all_servers, 1):
+                server_id = server.get("server_id")
+                server_name = server.get("server_name", "Unnamed Server")
+
+                # Get server detailed info
+                server_obj = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+
+                # Get status emojis based on available features
+                killfeed_status = "✅" if server_obj and hasattr(server_obj, "killfeed_channel_id") and server_obj.killfeed_channel_id else "❌"
+                events_status = "✅" if server_obj and hasattr(server_obj, "events_channel_id") and server_obj.events_channel_id else "❌"
+                connections_status = "✅" if server_obj and hasattr(server_obj, "connections_channel_id") and server_obj.connections_channel_id else "❌"
+
+                # Determine if server is in both collections or only in standalone
+                in_guild = server_id in guild_server_ids
+                server_source = "Both Collections" if in_guild else "Standalone Only"
+
+                # Build config details
+                config_details = [
+                    f"**ID:** `{server_id}`",
+                    f"**Source:** `{server_source}`",
+                    f"**Killfeed:** {killfeed_status}",
+                    f"**Events:** {events_status}",
+                    f"**Connections:** {connections_status}"
+                ]
+
+                # Add server to embed
+                embed.add_field(
+                    name=f"{i}. {server_name}",
+                    value="\n".join(config_details),
+                    inline=True
+                )
+
+            # Send embed
+            await hybrid_send(ctx, embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in list_servers command: {e}", exc_info=True)
+            await hybrid_send(ctx, f"An error occurred: {str(e)}")
+
+    @setup.command(name="parsehistorical", description="Parse historical data for a server")
+    @app_commands.describe(
+        server_id="ID of the server to parse historical data for (leave empty for all servers)"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    @app_commands.guild_only()
+    async def historical_parse(self, ctx, server_id: str = None):
+        """Parse all historical data for a server"""
+        try:
+            # For slash commands, defer response to prevent timeout
+            await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild data
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                await hybrid_send(ctx, "This guild is not registered in the database.")
+                return
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # If no server ID was provided, ask to confirm parsing all servers
+            if server_id is None:
+                # Check if we have any servers
+                if not guild.servers or len(guild.servers) == 0:
+                    embed = await EmbedBuilder.create_info_embed(
+                        "No Servers Configured",
+                        "This guild does not have any servers configured."
+                    , guild=guild)
+
+                    await hybrid_send(ctx, embed=embed)
+                    return
+
+                # Show confirmation for all servers
+                embed = await EmbedBuilder.create_warning_embed(
+                    "Parse All Servers",
+                    f"You are about to parse historical data for all {len(guild.servers)} servers in this guild.\n\n"
+                    "This operation can take a long time depending on the amount of data.\n\n"
+                    "Use `/setup parsehistorical <server_id>` to parse a specific server instead."
+                , guild=guild)
+
+                # Send embed using hybrid helper
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Get the server by ID
+            server = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+            if not server:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Server Not Found",
+                    f"Could not find a server with ID '{server_id}' in this guild."
+                , guild=guild)
+
+                await hybrid_send(ctx, embed=embed)
+                return
+
+            # Start historical parse
+            embed = await EmbedBuilder.create_info_embed(
+                "Historical Parse Starting",
+                f"Starting historical data parsing for server '{server.name}'.\n\n"
+                "This process will run in the background and may take some time depending on the amount of data. "
+                "Progress updates will be sent to this channel."
+            , guild=guild)
+
+            # Send using hybrid helper
+            message = await hybrid_send(ctx, embed=embed)
+
+            # Start the historical parse task
+            background_task = asyncio.create_task(self._historical_parse_task(server, message))
+
+            # Store the task in the bot instance to prevent it from being garbage collected
+            if not hasattr(self.bot, 'background_tasks'):
+                self.bot.background_tasks = []
+            self.bot.background_tasks.append(background_task)
+
+        except Exception as e:
+            logger.error(f"Error in historical_parse command: {e}", exc_info=True)
+            await hybrid_send(ctx, f"An error occurred: {str(e)}")
+
+    async def _historical_parse_task(self, server, message):
+        """Background task for parsing historical data"""
+        try:
+            # Create SFTP client for the server
+            sftp_client = SFTPClient(
+                hostname=server.sftp_host,
+                port=server.sftp_port,
+                username=server.sftp_username,
+                password=server.sftp_password,
+                server_id=server.server_id
+            )
+
+            # Connect to SFTP
+            connected = await sftp_client.connect()
+            if not connected:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Connection Failed",
+                    f"Failed to connect to SFTP server: {sftp_client.last_error}"
+                )
+                await message.edit(embed=embed)
+                return
+
+            # Find all CSV files
+            embed = await EmbedBuilder.create_info_embed(
+                "Finding Files",
+                "Searching for CSV files..."
+            )
+            await message.edit(embed=embed)
+
+            # Look for CSV files in common locations
+            csv_files = await sftp_client.find_csv_files()
+
+            if not csv_files:
+                embed = await EmbedBuilder.create_error_embed(
+                    "No Files Found",
+                    "Could not find any CSV files on the server."
+                )
+                await message.edit(embed=embed)
+                await sftp_client.disconnect()
+                return
+
+            # Update with file count
+            embed = await EmbedBuilder.create_info_embed(
+                "Found Files",
+                f"Found {len(csv_files)} CSV files. Starting parse..."
+            )
+            await message.edit(embed=embed)
+
+            # Create CSV parser
+            csv_parser = CSVParser(server.server_id)
+
+            # Define a progress update function
+            total_size = 0
+            processed_size = 0
+            kills_processed = 0
+
+            async def update_progress(current_size, current_files, kills, lines_processed=0, estimated=None):
+                nonlocal processed_size
+                nonlocal kills_processed
+
+                processed_size += current_size
+                kills_processed += kills
+
+                progress_percent = (processed_size / total_size) * 100 if total_size > 0 else 0
+
+                # Update message with progress
+                embed = await EmbedBuilder.create_info_embed(
+                    "Parsing Progress",
+                    f"Parsing historical data for server '{server.name}':\n\n"
+                    f"• Files processed: {current_files}/{len(csv_files)}\n"
+                    f"• Progress: {progress_percent:.2f}%\n"
+                    f"• Kills processed: {kills_processed}\n"
+                    f"• Lines processed: {lines_processed:,}\n"
+                )
+
+                if estimated is not None:
+                    embed.add_field(
+                        name="Estimated Time Remaining",
+                        value=f"{estimated} minutes",
+                        inline=False
+                    )
+
+                await message.edit(embed=embed)
+
+            # Calculate total size of files to process
+            for file_path in csv_files:
+                file_info = await sftp_client.get_file_info(file_path)
+                if file_info and 'size' in file_info:
+                    total_size += file_info['size']
+
+            # Process each file
+            for i, file_path in enumerate(csv_files, 1):
+                try:
+                    # Get file info
+                    file_info = await sftp_client.get_file_info(file_path)
+                    if not file_info or 'size' not in file_info:
+                        logger.warning(f"Could not get size for file {file_path}")
+                        file_size = 0
+                    else:
+                        file_size = file_info['size']
+
+                    # Download file
+                    local_file = await sftp_client.download_file(file_path)
+                    if not local_file:
+                        logger.warning(f"Failed to download {file_path}")
+                        continue
+
+                    # Parse file
+                    result = await csv_parser.parse_file(
+                        self.bot.db, 
+                        local_file, 
+                        callback=lambda progress, kills, lines, estimated: 
+                            update_progress(file_size * progress, i, kills, lines, estimated)
+                    )
+
+                    # Clean up local file
+                    try:
+                        os.remove(local_file)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove temp file {local_file}: {e}")
+
+                except Exception as e:
+                    logger.error(f"Error processing file {file_path}: {e}")
+
+            # Disconnect SFTP
+            await sftp_client.disconnect()
+
+            # Final report
+            embed = await EmbedBuilder.create_success_embed(
+                "Parse Complete",
+                f"Successfully parsed historical data for server '{server.name}'.\n\n"
+                f"• Files processed: {len(csv_files)}\n"
+                f"• Kills processed: {kills_processed}\n"
+            )
+            await message.edit(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in historical parse task: {e}", exc_info=True)
+            try:
+                embed = await EmbedBuilder.create_error_embed(
+                    "Parse Error",
+                    f"An error occurred during historical parsing: {str(e)}"
+                )
+                await message.edit(embed=embed)
+            except:
+                pass
+
+    @setup.command(name="diagnosedb", description="Diagnose database issues")
+    @app_commands.describe(
+        server_id="ID of the server to diagnose (optional)"
+    )
+    @app_commands.autocomplete(server_id=server_id_autocomplete)
+    @app_commands.guild_only()
+    async def diagnose_db(self, ctx, server_id: str = None):
+        """Diagnose database type consistency issues."""
+        try:
+            # For slash commands, defer response to prevent timeout
+            # For text commands, this will be a noop
+            if hasattr(ctx, 'interaction') and ctx.interaction:
+                await ctx.defer()
+
+            # Check permissions
+            if await self._check_permission(ctx):
+                return
+
+            # Get guild data
+            guild_data = await self.bot.db.guilds.find_one({"guild_id": str(ctx.guild.id)})
+            if not guild_data:
+                # Use appropriate response method based on context
+                if hasattr(ctx, 'interaction') and ctx.interaction:
+                    await ctx.followup.send("This guild is not registered in the database.")
+                else:
+                    await ctx.send("This guild is not registered in the database.")
+                return
+
+            # Create guild model
+            guild = Guild(self.bot.db, guild_data)
+
+            # Create initial response
+            embed = await EmbedBuilder.create_info_embed(
+                "Database Diagnosis",
+                "Analyzing database records for consistency issues..."
+            , guild=guild)
+
+            # Send using hybrid helper
+            message = await hybrid_send(ctx, embed=embed)
+
+            issues = []
+
+            # Check guild document
+            guild_issues = []
+
+            if 'guild_id' not in guild_data:
+                guild_issues.append("Missing guild_id field")
+            elif not isinstance(guild_data['guild_id'], str):
+                guild_issues.append(f"guild_id is not a string type: {type(guild_data['guild_id']).__name__}")
+
+            if 'premium_tier' in guild_data:
+                if not isinstance(guild_data['premium_tier'], int):
+                    guild_issues.append(f"premium_tier is not an integer type: {type(guild_data['premium_tier']).__name__}")
+
+            if 'servers' in guild_data:
+                if not isinstance(guild_data['servers'], list):
+                    guild_issues.append(f"servers is not a list type: {type(guild_data['servers']).__name__}")
+
+            if guild_issues:
+                issues.append(f"**Guild Issues:**\n- " + "\n- ".join(guild_issues))
+
+            # If server_id is provided, check that specific server
+            if server_id:
+                # Get the server document
+                server = await Server.get_by_id(self.bot.db, server_id, str(ctx.guild.id))
+                if not server:
+                    embed = await EmbedBuilder.create_error_embed(
+                        "Server Not Found",
+                        f"Could not find a server with ID '{server_id}' in this guild."
+                    , guild=guild)
+                    await message.edit(embed=embed)
+                    return
+
+                # Check server document from db
+                server_doc = await self.bot.db.game_servers.find_one({"server_id": server_id})
+                if not server_doc:
+                    embed = await EmbedBuilder.create_error_embed(
+                        "Server Document Not Found",
+                        f"Could not find a database document for server '{server_id}'."
+                    , guild=guild)
+                    await message.edit(embed=embed)
+                    return
+
+                server_issues = []
+
+                # Check server_id type
+                if 'server_id' not in server_doc:
+                    server_issues.append("Missing server_id field")
+                elif not isinstance(server_doc['server_id'], str):
+                    server_issues.append(f"server_id is not a string type: {type(server_doc['server_id']).__name__}")
+
+                # Check guild_id type
+                if 'guild_id' not in server_doc:
+                    server_issues.append("Missing guild_id field")
+                elif not isinstance(server_doc['guild_id'], str):
+                    server_issues.append(f"guild_id is not a string type: {type(server_doc['guild_id']).__name__}")
+
+                # Check SFTP settings
+                if 'sftp_host' in server_doc and server_doc['sftp_host'] is not None and not isinstance(server_doc['sftp_host'], str):
+                    server_issues.append(f"sftp_host is not a string type: {type(server_doc['sftp_host']).__name__}")
+
+                if 'sftp_port' in server_doc and server_doc['sftp_port'] is not None and not isinstance(server_doc['sftp_port'], int):
+                    server_issues.append(f"sftp_port is not an integer type: {type(server_doc['sftp_port']).__name__}")
+
+                # Check channel IDs
+                for channel_field in ['killfeed_channel_id', 'events_channel_id', 'connections_channel_id']:
+                    if channel_field in server_doc and server_doc[channel_field] is not None:
+                        if not isinstance(server_doc[channel_field], str):
+                            server_issues.append(f"{channel_field} is not a string type: {type(server_doc[channel_field]).__name__}")
+
+                if server_issues:
+                    issues.append(f"**Server Issues ({server.name}):**\n- " + "\n- ".join(server_issues))
+
+                # Check for duplicate server entries
+                duplicate_check = await self.bot.db.game_servers.count_documents({"server_id": server_id})
+                if duplicate_check > 1:
+                    issues.append(f"**Duplicate Entries:**\nFound {duplicate_check} documents with server_id '{server_id}'")
+
+                # Check for any players
+                player_count = await self.bot.db.players.count_documents({"server_id": server_id})
+
+                # Sample some player documents for type issues
+                if player_count > 0:
+                    player_issues = []
+                    players = await self.bot.db.players.find({"server_id": server_id}).limit(5).to_list(length=5)
+
+                    for player in players:
+                        if 'server_id' in player and not isinstance(player['server_id'], str):
+                            player_issues.append(f"player {player.get('name', '?')}: server_id is not a string type")
+
+                        if 'kills' in player and not isinstance(player['kills'], int):
+                            player_issues.append(f"player {player.get('name', '?')}: kills is not an integer type")
+
+                    if player_issues:
+                        issues.append(f"**Player Issues (sample of {min(player_count, 5)}/{player_count}):**\n- " + "\n- ".join(player_issues))
+
+            else:
+                # Check all servers
+                server_issues = []
+                servers = await self.bot.db.game_servers.find({"guild_id": str(ctx.guild.id)}).to_list(length=100)
+
+                for server_doc in servers:
+                    if 'server_id' not in server_doc:
+                        server_issues.append(f"Server missing server_id field")
+                        continue
+
+                    server_id = server_doc['server_id']
+                    server_name = server_doc.get('name', server_id)
+
+                    # Check type issues
+                    issues_found = []
+
+                    if not isinstance(server_id, str):
+                        issues_found.append(f"server_id is not a string type: {type(server_id).__name__}")
+
+                    if 'guild_id' not in server_doc:
+                        issues_found.append("Missing guild_id field")
+                    elif not isinstance(server_doc['guild_id'], str):
+                        issues_found.append(f"guild_id is not a string type: {type(server_doc['guild_id']).__name__}")
+
+                    if issues_found:
+                        server_issues.append(f"Server '{server_name}': " + ", ".join(issues_found))
+
+                if server_issues:
+                    issues.append(f"**Server Issues (summary):**\n- " + "\n- ".join(server_issues))
+
+            # Final report
+            if issues:
+                embed = await EmbedBuilder.create_warning_embed(
+                    "Database Diagnosis Results",
+                    f"Found {len(issues)} issue categories in the database:\n\n" + "\n\n".join(issues)
+                , guild=guild)
+            else:
+                embed = await EmbedBuilder.create_success_embed(
+                    "Database Diagnosis Results",
+                    "No issues found in the database. All data types appear to be consistent."
+                , guild=guild)
+
+            await message.edit(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in diagnose_db command: {e}", exc_info=True)
+            try:
+                await hybrid_send(ctx, f"An error occurred while diagnosing the database: {str(e)}")
+            except:
+                pass
+
+    async def _check_permission(self, ctx) -> bool:
+        """Check if user has permission to use the command"""
+        if has_admin_permission(ctx):
+            return False
+        await hybrid_send(ctx, "You need to have the 'Manage Server' permission to use this command.")
+        return True
+
+async def setup(bot):
+    """Set up the Setup cog"""
+    await bot.add_cog(Setup(bot))
