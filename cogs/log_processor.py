@@ -306,16 +306,25 @@ class LogProcessorCog(commands.Cog):
                 # This is the same ID used by the CSV processor
                 path_server_id = None
                 
-                # Method 0: Special case for Tower of Temptation - ALWAYS check this first
-                # If we know this is the Tower of Temptation server, immediately use the known ID
-                if server_id == "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3" or (
-                    # Also check hostname and server name for Tower of Temptation references
-                    (hasattr(config, 'get') and 
-                    ('tower' in config.get('server_name', '').lower() and 'temptation' in config.get('server_name', '').lower())) or
-                    ('tower' in hostname.lower() and 'temptation' in hostname.lower())
-                ):
-                    path_server_id = "7020"
-                    logger.info(f"Using known numeric ID '7020' for Tower of Temptation server")
+                # Method 0: Use server_identity module for consistent server ID resolution
+                from utils.server_identity import identify_server
+                
+                # Get server properties for identification
+                server_name = config.get("server_name", "") if hasattr(config, 'get') else ""
+                guild_id = config.get("guild_id", None) if hasattr(config, 'get') else None
+                
+                # Get consistent numeric ID for path construction
+                numeric_id, is_known = identify_server(
+                    server_id=server_id,
+                    hostname=hostname,
+                    server_name=server_name,
+                    guild_id=guild_id
+                )
+                
+                # Use the identified ID if it's a known server or different from what we have
+                if is_known:
+                    path_server_id = numeric_id
+                    logger.info(f"Using known numeric ID '{numeric_id}' for Tower of Temptation server")
                 else:
                     # Method 1: Get original_server_id directly from config if available
                     original_id = config.get("original_server_id")

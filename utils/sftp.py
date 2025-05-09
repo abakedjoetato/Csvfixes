@@ -527,12 +527,40 @@ class SFTPManager:
         if not self.client:
             logger.error(f"SFTP client is missing when trying to get file info: {path}")
             return None
-
+            
         try:
             return await self.client.get_file_info(path)
         except Exception as e:
             logger.error(f"Failed to get file info for {path}: {e}")
             return None
+            
+    async def is_file(self, path: str) -> bool:
+        """Check if a path is a file (not a directory) on the SFTP server
+
+        Args:
+            path: Path to check
+
+        Returns:
+            bool: True if path is a file, False otherwise
+        """
+        if not self.client:
+            logger.error(f"SFTP client is missing when trying to check if path is a file: {path}")
+            return False
+
+        try:
+            # Use client's is_file method if available
+            if hasattr(self.client, 'is_file'):
+                return await self.client.is_file(path)
+            
+            # Otherwise use get_file_info to determine if it's a file
+            file_info = await self.get_file_info(path)
+            if file_info and isinstance(file_info, dict):
+                return file_info.get("is_file", False)
+            
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to check if path is a file {path}: {e}")
+            return False
 
     async def download_file(self, remote_path: str, local_path: Optional[str] = None) -> Optional[bytes]:
         """Download a file from the SFTP server
@@ -2010,11 +2038,14 @@ class SFTPClient:
             return []
 
         try:
+            # Explicitly initialize result list to ensure it's never None
             result = []
             pattern_re = re.compile(pattern)
 
+            # Pass the initialized result list to the recursive function
             await self._find_files_recursive(directory, pattern_re, result, recursive, max_depth, 0)
 
+            # Return the populated result list
             return result
         except Exception as e:
             logger.error(f"Error in find_files_by_pattern: {str(e)}")
@@ -2126,10 +2157,21 @@ class SFTPClient:
             if path_server_id is not None:
                 path_server_id = str(path_server_id)
             
-            # Special case for Tower of Temptation server
-            if self.server_id == "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3" and not str(path_server_id).isdigit():
-                path_server_id = "7020"
-                logger.info(f"Using known ID '7020' for Tower of Temptation server")
+            # Use the server_identity module for consistent path construction
+            from utils.server_identity import identify_server
+            
+            # Get consistent numeric ID for path construction
+            numeric_id, is_known = identify_server(
+                server_id=path_server_id,
+                hostname=self.hostname,
+                server_name=getattr(self, 'server_name', None),
+                guild_id=getattr(self, 'guild_id', None)
+            )
+            
+            # Use the identified numeric ID
+            if is_known or numeric_id != path_server_id:
+                logger.info(f"Using identified numeric ID '{numeric_id}' for path construction instead of '{path_server_id}'")
+                path_server_id = numeric_id
             
             # Log which server ID we're using for path construction
             logger.info(f"Using server ID '{path_server_id}' for path construction in get_log_file")
@@ -2232,9 +2274,9 @@ class SFTPClient:
             logger.debug(f"Max depth {max_depth} reached at {directory}")
             return result
 
-        # Safety check - make sure result is a list
-        if not result:
-            logger.warning("Result list was None in _find_files_recursive, creating new list")
+        # Safety check - make sure result is a valid list
+        if result is None or not isinstance(result, list):
+            logger.warning("Result list was None or not a list in _find_files_recursive, creating new list")
             result = []
 
         try:

@@ -296,13 +296,29 @@ class CSVProcessorCog(commands.Cog):
                 if not original_server_id:
                     original_server_id = raw_server_id
                     
-                # Special case for Tower of Temptation
-                if server_id == "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3" or (
-                    server.get("server_name", "").lower().find("tower") >= 0 and 
-                    server.get("server_name", "").lower().find("temptation") >= 0
-                ):
-                    original_server_id = "7020"
-                    logger.info(f"Setting Tower of Temptation server ID to known numeric ID: 7020")
+                # Use server_identity module for consistent ID resolution
+                from utils.server_identity import identify_server
+                
+                # Get consistent ID for this server
+                server_name = server.get("server_name", "")
+                guild_id = server.get("guild_id")
+                hostname = sftp_host
+                
+                numeric_id, is_known = identify_server(
+                    server_id=server_id,
+                    hostname=hostname,
+                    server_name=server_name,
+                    guild_id=guild_id
+                )
+                
+                # Use the identified ID
+                if is_known or numeric_id != original_server_id:
+                    # Only log if we're changing the ID
+                    if is_known:
+                        logger.info(f"Using known numeric ID '{numeric_id}' for server {server_id}")
+                    else:
+                        logger.info(f"Using derived numeric ID '{numeric_id}' for server {server_id}")
+                    original_server_id = numeric_id
                 
                 # Log the original server ID being used
                 logger.debug(f"Using original_server_id={original_server_id} for server {server_id}")
@@ -418,33 +434,29 @@ class CSVProcessorCog(commands.Cog):
                 # Always try to get original_server_id first
                 path_server_id = config.get("original_server_id")
 
-                # Special case for Tower of Temptation
-                if server_id == "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3":
-                    path_server_id = "7020"
-                    logger.info(f"Using known Tower of Temptation server ID: 7020")
+                # Use server_identity module for consistent ID resolution
+                from utils.server_identity import identify_server
                 
-                # If no original_server_id, try numeric extraction from hostname
-                if not path_server_id:
-                    hostname = config.get("hostname", "")
-                    if "_" in hostname:
-                        potential_id = hostname.split("_")[-1]
-                        if potential_id.isdigit():
-                            path_server_id = potential_id
-                            logger.info(f"Using numeric ID from hostname: {potential_id}")
-
-                # Check for Tower of Temptation by server name
-                if not path_server_id:
-                    server_name = config.get("server_name", "")
-                    if server_name and "tower" in str(server_name).lower() and "temptation" in str(server_name).lower():
-                        path_server_id = "7020"
-                        logger.info(f"Detected Tower of Temptation server by name, using ID: 7020")
-                    # Otherwise try to extract numeric ID from server name
-                    elif server_name:
-                        for word in str(server_name).split():
-                            if word.isdigit() and len(word) >= 4:
-                                path_server_id = word
-                                logger.info(f"Using numeric ID from server name: {word}")
-                                break
+                # Get server properties for identification
+                hostname = config.get("hostname", "")
+                server_name = config.get("server_name", "")
+                guild_id = config.get("guild_id")
+                
+                # Identify server using our consistent module
+                numeric_id, is_known = identify_server(
+                    server_id=server_id,
+                    hostname=hostname,
+                    server_name=server_name,
+                    guild_id=guild_id
+                )
+                
+                # Use the identified consistent ID
+                if is_known or numeric_id != path_server_id:
+                    if is_known:
+                        logger.info(f"Using known numeric ID '{numeric_id}' for server {server_id}")
+                    else:
+                        logger.info(f"Using identified numeric ID '{numeric_id}' from server {server_id}")
+                    path_server_id = numeric_id
 
                 # Last resort: use server_id but log warning
                 if not path_server_id:

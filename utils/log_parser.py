@@ -354,13 +354,25 @@ class LogParser:
         self.server_uuid = server_id  # The UUID format ID for database records
         self.original_server_id = original_server_id or server_id  # The original/numeric ID for path construction
         
-        # Special case for Tower of Temptation server
-        if server_id == "1b1ab57e-8749-4a40-b7a1-b1073a5f24b3" or (
-            # Check hostname for Tower of Temptation references
-            hostname and 'tower' in hostname.lower() and 'temptation' in hostname.lower()
-        ):
-            logger.info("Using known numeric ID '7020' for Tower of Temptation server in LogParser")
-            self.original_server_id = "7020"
+        # Use the server_identity module for consistent identity persistence
+        if not self.original_server_id or not str(self.original_server_id).isdigit():
+            from utils.server_identity import identify_server
+            
+            # Get consistent numeric ID for server identification
+            numeric_id, is_known = identify_server(
+                server_id=server_id,
+                hostname=hostname,
+                server_name=getattr(self, 'server_name', None),
+                guild_id=getattr(self, 'guild_id', None)
+            )
+            
+            # Use the identified numeric ID for path construction
+            if numeric_id != self.original_server_id:
+                if is_known:
+                    logger.info(f"Using known numeric ID '{numeric_id}' for server in LogParser")
+                else:
+                    logger.info(f"Using derived numeric ID '{numeric_id}' for server in LogParser")
+                self.original_server_id = numeric_id
             
         # Use standardized log path structure with NUMERIC server ID, not UUID
         clean_hostname = hostname.split(':')[0] if hostname else "server"
