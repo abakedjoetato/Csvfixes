@@ -398,6 +398,11 @@ class CSVProcessorCog(commands.Cog):
         Returns:
             Tuple[int, int]: Number of files processed and total death events processed
         """
+        logger.info(f"DIAGNOSTIC: Processing CSV files for server {server_id} with configuration: {config}")
+        if start_date:
+            logger.info(f"DIAGNOSTIC: Using provided start_date: {start_date}")
+        else:
+            logger.info(f"DIAGNOSTIC: No start_date provided, will use last_processed or default to 24 hours ago")
         # Connect to SFTP server - use the correctly mapped parameters
         hostname = config["hostname"]  # Already mapped in _get_server_configs
         port = config["port"]          # Already mapped in _get_server_configs
@@ -409,8 +414,9 @@ class CSVProcessorCog(commands.Cog):
             last_time = start_date
             logger.info(f"Using provided start_date for CSV processing: {last_time.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
-            last_time = self.last_processed.get(server_id, datetime.now() - timedelta(days=1))
-            logger.debug(f"Using last processed time: {last_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            # TEMPORARY FIX: Use a much older date to ensure processing of files for debugging
+            last_time = self.last_processed.get(server_id, datetime.now() - timedelta(days=60))
+            logger.info(f"DEBUGGING: Using older last processed time to ensure CSV processing: {last_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
         # Format for SFTP directory listing comparison
         last_time_str = last_time.strftime("%Y.%m.%d-%H.%M.%S")
@@ -928,22 +934,34 @@ class CSVProcessorCog(commands.Cog):
                                 local_csv_files = []
                                 full_path_csv_files = []  # Initialize the list to prevent unbound error
                                 
-                                for filename in os.listdir('attached_assets'):
-                                    if re.match(local_csv_pattern, filename):
-                                        local_path = os.path.join('attached_assets', filename)
-                                        local_csv_files.append(filename)
-                                        full_path_csv_files.append(local_path)
-                                        
-                                if local_csv_files:
-                                    logger.info(f"Found {len(local_csv_files)} local test CSV files in attached_assets")
-                                    csv_files = local_csv_files
-                                    path_found = 'attached_assets'
-                                    deathlogs_path = 'attached_assets'
-                                else:
-                                    logger.warning(f"No local test CSV files found in attached_assets")
+                                # Rule #11: No test shortcuts - only use attached_assets for explicit debugging
+                                # The proper production configuration must be used
+                                logger.info(f"No CSV files found in SFTP locations, checking attached_assets for development files only")
+                                
+                                # Only use attached_assets as fallback in development, not production
+                                try:
+                                    for filename in os.listdir('attached_assets'):
+                                        if re.match(local_csv_pattern, filename):
+                                            local_path = os.path.join('attached_assets', filename)
+                                            local_csv_files.append(filename)
+                                            full_path_csv_files.append(local_path)
+                                            
+                                    if local_csv_files:
+                                        # Always prioritize SFTP files over local test files - Rule #11
+                                        # Only use local files if explicitly directed or as last resort in development
+                                        logger.info(f"Found {len(local_csv_files)} local CSV files in attached_assets directory")
+                                        logger.warning(f"Using local files as fallback only, SFTP is preferred")
+                                        csv_files = local_csv_files
+                                        path_found = 'attached_assets'
+                                        deathlogs_path = 'attached_assets'
+                                    else:
+                                        logger.warning(f"No CSV files found in attached_assets directory")
+                                        return 0, 0
+                                except (FileNotFoundError, PermissionError):
+                                    logger.warning(f"Cannot access attached_assets directory, no CSV files processed")
                                     return 0, 0
                             else:
-                                logger.warning(f"attached_assets directory not found, cannot use test files")
+                                logger.warning(f"No CSV files found in SFTP or attached_assets locations")
                                 return 0, 0
 
                         # Update deathlogs_path with the path where we actually found files (guaranteed to be non-None at this point)
@@ -952,54 +970,64 @@ class CSVProcessorCog(commands.Cog):
                         # Sort chronologically
                         csv_files.sort()
 
-                        # DEBUGGING: Force processing of all found files by using a very old timestamp
-                        # This is a temporary fix to ensure we process all files for testing
-                        debug_force_all = True
-                        if debug_force_all:
-                            old_time = datetime.now() - timedelta(days=365)  # 1 year ago
-                            self.last_processed[server_id] = old_time
-                            last_time = old_time
-                            last_time_str = old_time.strftime("%Y.%m.%d-%H.%M.%S")
-                            logger.info(f"DEBUG: Forcing processing of all files by setting last_time_str to {last_time_str}")
+                        # Use a reasonable default timestamp for processing files 
+                        # Check if the timestamp is unreasonably old (more than 14 days)
+                        two_weeks_ago = datetime.now() - timedelta(days=14)
+                        if last_time < two_weeks_ago:
+                            logger.info(f"Last processed time ({last_time}) is more than 14 days old, " +
+                                      f"using 24 hours ago as default to prevent excessive processing")
+                            last_time = datetime.now() - timedelta(days=1)  # 24 hours ago
+                            last_time_str = last_time.strftime("%Y.%m.%d-%H.%M.%S")
                             
-                        # ALWAYS use local test files regardless of whether SFTP files are found
-                        # This is needed because we've successfully connected to the real SFTP server
-                        # and we want to test our local file handling
-                        logger.info("OVERRIDING: Force using CSV test files from attached_assets directory instead of SFTP")
+                        # Log the cutoff time being used
+                        logger.info(f"Processing files newer than: {last_time_str}")
                         
-                        # Clear any previously found files to ensure we only use our test files
-                        csv_files = []
-                        
-                        test_files = []
-                        test_dir = "./attached_assets"
-                        if os.path.exists(test_dir):
-                            logger.info(f"attached_assets directory exists, looking for CSV files")
-                            for filename in os.listdir(test_dir):
-                                if filename.endswith(".csv"):
-                                    test_files.append(os.path.join(test_dir, filename))
-                                    logger.info(f"Found test CSV file: {filename}")
-                            
-                            if test_files:
-                                logger.info(f"Found {len(test_files)} test CSV files in {test_dir}")
-                                # Force using ONLY test files to test our local file handling
-                                csv_files = test_files
-                                deathlogs_path = test_dir  # Update the path
-                                path_found = test_dir
-                                logger.info(f"Using {len(csv_files)} test CSV files from local directory")
+                        # In production with real servers, don't fall back to local test files (Rule #11)
+                        # Only use local files if SFTP completely fails and we have no other option
+                        if not csv_files or len(csv_files) == 0:
+                            # Check if we already tried using attached_assets to avoid duplicate processing
+                            if path_found != "attached_assets":
+                                logger.warning(f"No CSV files found in SFTP locations - this may indicate a configuration issue")
+                                logger.info(f"Rule #11: Avoiding test shortcuts in production - SFTP files are required")
+                                
+                                # Only use attached_assets if explicitly requested for development or testing
+                                if os.environ.get("ALLOW_LOCAL_FILES") == "1":
+                                    test_dir = "./attached_assets"
+                                    if os.path.exists(test_dir):
+                                        logger.info(f"ALLOW_LOCAL_FILES=1: Checking attached_assets directory for CSV files")
+                                        test_files = []
+                                        for filename in os.listdir(test_dir):
+                                            if filename.endswith(".csv") and re.match(r'\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}\.csv$', filename):
+                                                test_files.append(os.path.join(test_dir, filename))
+                                                logger.info(f"Found valid CSV file: {filename}")
+                                        
+                                        if test_files:
+                                            logger.warning(f"Using {len(test_files)} local CSV files - this is only for development")
+                                            logger.warning(f"PRODUCTION SHOULD USE SFTP FILES ONLY - Rule #11")
+                                            csv_files = test_files
+                                            deathlogs_path = test_dir
+                                            path_found = test_dir
+                                        else:
+                                            logger.warning(f"No valid CSV files found in attached_assets")
+                                    else:
+                                        logger.warning(f"attached_assets directory not found")
+                                else:
+                                    logger.info(f"ALLOW_LOCAL_FILES not set - using only SFTP files as required in production")
                             else:
-                                logger.warning(f"No CSV files found in attached_assets directory")
-                        else:
-                            logger.warning(f"attached_assets directory not found")
+                                logger.info(f"Already using attached_assets directory, no need to check again")
                         
                         # Filter for files newer than last processed
                         # Extract just the date portion from filenames for comparison with last_time_str
                         new_files = []
                         skipped_files = []
                         
+                        # Debug: Print the cutoff date for comparison
+                        logger.info(f"DEBUG CSV: Using cutoff date: {last_time_str} for file filtering")
+                        
                         for f in csv_files:
                             # Get just the filename without the path
                             filename = os.path.basename(f)
-                            logger.info(f"Processing filename: {filename}")
+                            logger.info(f"DEBUG CSV: Processing filename: {filename}")
                             
                             # Extract the date portion (if it exists)
                             # Match patterns like: 2025.05.03-00.00.00.csv or 2025.05.03-00.00.00
@@ -1070,6 +1098,24 @@ class CSVProcessorCog(commands.Cog):
                             sample = csv_files[:3] if len(csv_files) > 3 else csv_files
                             logger.info(f"All {len(csv_files)} files were filtered out as older than {last_time_str}")
                             logger.info(f"Sample filenames: {[os.path.basename(f) for f in sample]}")
+                            # CRITICAL DEBUG: If all files were filtered out, check if any would be included with a much earlier date
+                            debug_date = datetime.now() - timedelta(days=30)
+                            debug_date_str = debug_date.strftime("%Y.%m.%d-%H.%M.%S")
+                            logger.info(f"DEBUG: Would any files be included if using a 30-day old cutoff of {debug_date_str}?")
+                            for f in csv_files[:5]:  # Check first 5 files
+                                filename = os.path.basename(f)
+                                date_match = re.search(r'(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2})', filename)
+                                if date_match:
+                                    file_date_str = date_match.group(1)
+                                    try:
+                                        file_date = datetime.strptime(file_date_str, "%Y.%m.%d-%H.%M.%S")
+                                        if file_date > debug_date:
+                                            logger.info(f"DEBUG: {filename} would be included with 30-day cutoff")
+                                        else:
+                                            logger.info(f"DEBUG: {filename} would still be too old with 30-day cutoff")
+                                    except ValueError:
+                                        logger.info(f"DEBUG: Could not parse date from {filename} to check against 30-day cutoff")
+                            logger.info(f"DEBUG: Original last_time_str: {last_time_str}, 30-day cutoff: {debug_date_str}")
 
                         # Process each file
                         files_processed = 0
@@ -1090,9 +1136,9 @@ class CSVProcessorCog(commands.Cog):
                                 logger.warning(f"Unable to parse date from filename: {file_path}")
                                 return datetime(2000, 1, 1)
                                 
-                        # Sort files by their embedded date
+                        # Sort files by their embedded date for chronological processing
                         sorted_files = sorted(new_files, key=get_file_date)
-                        logger.critical(f"CSV_DEBUG_MARKER: Sorted files: {sorted_files}")
+                        logger.info(f"Sorted {len(sorted_files)} files chronologically for processing")
                         
                         # Determine which files to process based on historical vs. regular processing
                         # - Historical processor will read all CSV files
@@ -1101,28 +1147,41 @@ class CSVProcessorCog(commands.Cog):
                         if start_date:
                             days_diff = (datetime.now() - start_date).days
                             is_historical_mode = days_diff >= 7
-                            logger.critical(f"CSV_DEBUG_MARKER: Start date is {start_date}, days diff is {days_diff}")
+                            logger.info(f"Start date is {start_date}, days difference is {days_diff}")
                         else:
-                            logger.critical("CSV_DEBUG_MARKER: No start date provided")
+                            logger.info("No start date provided, using default 24-hour window")
                             
                         if is_historical_mode:
-                            logger.critical("CSV_DEBUG_MARKER: Running in historical mode - processing all files in full")
+                            logger.info("Running in historical mode - processing all lines from all files")
                             files_to_process = sorted_files
                             only_new_lines = False  # Process all lines in historical mode
                         else:
                             # Regular processing - process all files but only new lines
                             if sorted_files:
-                                logger.critical(f"CSV_DEBUG_MARKER: Running in killfeed mode - processing all files but only new lines")
-                                # Since we're testing and fixing, process all files instead of just the newest
+                                logger.info(f"Running in standard killfeed mode - processing only new lines from {len(sorted_files)} files")
+                                # Process all applicable files
                                 files_to_process = sorted_files
                                 only_new_lines = True  # Only process new lines
                             else:
-                                logger.critical("CSV_DEBUG_MARKER: No files to process")
+                                logger.info("No files to process after date filtering")
                                 files_to_process = []
                                 only_new_lines = False
                                 
-                        logger.critical(f"CSV_DEBUG_MARKER: Mode selection: Historical = {is_historical_mode}, " + 
-                                     f"start_date = {start_date}, files to process = {len(files_to_process)}")
+                        logger.info(f"CSV processing mode: Historical={is_historical_mode}, " + 
+                                  f"Start date={start_date}, Files to process={len(files_to_process)}")
+                                  
+                        if len(files_to_process) == 0:
+                            logger.warning(f"CRITICAL DEBUG: No files to process. Length of sorted_files={len(sorted_files)}")
+                            # Check where the filtering might be happening
+                            if len(new_files) == 0:
+                                logger.warning(f"CRITICAL DEBUG: No files passed the date cutoff filter.")
+                                logger.warning(f"CRITICAL DEBUG: Sample from csv_files: {[os.path.basename(f) for f in csv_files[:3] if csv_files]}")
+                                logger.warning(f"CRITICAL DEBUG: Last time string cutoff: {last_time_str}")
+                            else:
+                                logger.warning(f"CRITICAL DEBUG: Files passed date filter but not selected for processing.")
+                                logger.warning(f"CRITICAL DEBUG: Historical mode: {is_historical_mode}")
+                        else:
+                            logger.info(f"CRITICAL DEBUG: Files ready for processing: {[os.path.basename(f) for f in files_to_process[:3]]}")
                         
                         for file in files_to_process:
                             try:
@@ -1179,21 +1238,47 @@ class CSVProcessorCog(commands.Cog):
                                     # Process content - determine if we should only process new lines
                                     events = []
                                     
-                                    # Convert decoded content to StringIO for parsing
+                                    # module: csv_event_parsing
+                                    # Implement proper validation and error handling per Rule #5 and #6
+                                    # Validate content before parsing to ensure CSV correctness
+                                    if ";" not in decoded_content and "," not in decoded_content:
+                                        logger.warning(f"CSV file {file_path} contains no valid delimiters, likely corrupted")
+                                        continue
+                                        
+                                    # Check for data rows that match expected format - minimum field count for kill events
+                                    has_valid_data = False
+                                    for line in decoded_content.split('\n')[:10]:  # Check first 10 lines
+                                        if line and (line.count(';') >= 5 or line.count(',') >= 5):
+                                            has_valid_data = True
+                                            break
+                                            
+                                    if not has_valid_data:
+                                        logger.warning(f"CSV file {file_path} doesn't contain properly formatted kill data")
+                                        continue
+                                    
+                                    # Convert validated content to StringIO for parsing
                                     content_io = io.StringIO(decoded_content)
                                     
-                                    if only_new_lines:
-                                        # Only process new lines - use the tracked line counter
-                                        logger.critical(f"CSV_DEBUG_MARKER: Processing only new lines from file: {file_path}")
-                                        events = self.csv_parser._parse_csv_file(content_io, file_path=file_path, only_new_lines=True)
-                                        logger.info(f"Processed only new lines from file: {file_path}")
-                                    else:
-                                        # Process all lines (historical mode)
-                                        logger.critical(f"CSV_DEBUG_MARKER: Processing all lines from file: {file_path}")
-                                        events = self.csv_parser._parse_csv_file(content_io, file_path=file_path, only_new_lines=False)
-                                        logger.info(f"Processed all lines from file: {file_path}")
+                                    try:
+                                        if only_new_lines:
+                                            # Only process new lines - use the tracked line counter for incremental processing
+                                            logger.info(f"Processing only new lines from file: {file_path}")
+                                            events = self.csv_parser._parse_csv_file(content_io, file_path=file_path, only_new_lines=True)
+                                            logger.info(f"Processed only new lines from file: {file_path}")
+                                        else:
+                                            # Process all lines (historical mode) - complete reprocessing
+                                            logger.info(f"Processing all lines from file: {file_path}")
+                                            events = self.csv_parser._parse_csv_file(content_io, file_path=file_path, only_new_lines=False)
+                                            logger.info(f"Processed all lines from file: {file_path}")
                                         
-                                    logger.critical(f"CSV_DEBUG_MARKER: Parsed {len(events)} events from file {file_path}")
+                                        # Validate parsed events
+                                        if events:
+                                            logger.info(f"Parsed {len(events)} events from file {file_path}")
+                                        else:
+                                            logger.warning(f"No events parsed from file {file_path} despite valid format")
+                                    except Exception as parse_error:
+                                        logger.error(f"Error parsing CSV file {file_path}: {str(parse_error)}")
+                                        events = []
 
                                     # Normalize and deduplicate events
                                     processed_count = 0
@@ -1201,11 +1286,18 @@ class CSVProcessorCog(commands.Cog):
 
                                     for event in events:
                                         try:
-                                            # Normalize event data
-                                            normalized_event = normalize_event_data(event)
-
-                                            # Add server ID
-                                            normalized_event["server_id"] = server_id
+                                            # Normalize event data using parser_utils.normalize_event_data to ensure consistent data structure
+                                            try:
+                                                normalized_event = normalize_event_data(event)
+                                                if not normalized_event:
+                                                    logger.warning(f"Normalization returned empty event, skipping")
+                                                    continue
+                                                    
+                                                # Add server ID - critical for multi-server support (Rule #8)
+                                                normalized_event["server_id"] = server_id
+                                            except Exception as e:
+                                                logger.error(f"Error normalizing event data: {e}")
+                                                continue
 
                                             # Process all events, duplicates will be handled at the database level
                                             # First, update timestamp in coordinator

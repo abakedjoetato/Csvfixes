@@ -1,0 +1,108 @@
+TASK:
+CSV files are being detected but none are being processed. Previous shallow fixes have been ineffective. Initiate a full-stack diagnostic and resolution process.
+
+OBJECTIVE:
+Identify and resolve all logical, syntactic, or systemic faults in the CSV parsing pipeline to achieve successful CSV processing and full compliance with all 11 rules defined in rules.md.
+
+CONSTRAINTS:
+
+No superficial or cosmetic fixes permitted.
+
+Do not mark the issue resolved until the root cause is eliminated and processing is verifiably functional.
+
+All 11 rules in rules.md must be interpreted, applied, and enforced.
+
+
+PROCESS FLOW:
+
+1. System-Wide Trace:
+
+Perform deep trace of CSV parser module.
+
+Inspect all interconnected modules, including I/O, decoding, schema inference, and data dispatch.
+
+Identify and document any of the following:
+
+Logic faults (e.g. incorrect branching, missing handlers).
+
+Syntax errors (e.g. malformed statements, undeclared vars).
+
+Type mismatches (e.g. expected list → received None).
+
+Null reference accesses.
+
+Faulty CSV structure assumptions.
+
+
+
+
+2. Resource Utilization:
+
+Use sample CSV files in attached assets for validation.
+
+Simulate various file conditions: valid, invalid, empty, partially corrupted.
+
+
+
+3. Rules Compliance:
+
+Parse rules.md and enforce all 11 directives during all validation and execution processes.
+
+Log rule violations with file path, rule ID, and offending code segment.
+
+
+
+4. Knowledge Aggregation:
+
+Query external knowledge bases for common causes of silent CSV ingestion failures:
+
+Stack Overflow (https://stackoverflow.com)
+
+Reddit:
+
+r/learnprogramming
+
+r/AskProgramming
+
+r/discordapp
+
+
+Discord Forums:
+
+Reactiflux (React, JavaScript)
+
+DevCord (Front-end dev)
+
+CodeSupport (General dev support)
+
+The Coding Den (Multi-language)
+
+Nodeiflux (Node.js)
+
+Appwrite (Backend, open-source)
+
+The Programmer’s Hangout (General software engineering)
+
+
+
+
+
+5. Fix Implementation:
+
+Apply verified fixes to codebase.
+
+Re-test CSV parsing end-to-end using test files and rule compliance checks.
+
+
+
+6. Output:
+
+Summary report of issue cause, resolution steps, and validation results.
+
+List of all code changes made with file names and line ranges.
+
+
+
+
+END STATE:
+CSV files must be ingested and processed as expected. System must comply with all rules.md conditions. Zero known bugs, misconfigurations, or unhandled cases should remain.
